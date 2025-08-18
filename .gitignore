@@ -21,3 +21,5 @@ notebooks/eval_out/
 *.tmp.csv
 
 notebooks/inference_threshold.json
+
+notebooks/eda_and_feature_engineering.ipynb
