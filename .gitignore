@@ -1,3 +1,4 @@
+# Python / OS / IDE
 __pycache__/
 *.pyc
 .venv/
@@ -5,7 +6,16 @@ __pycache__/
 .idea/
 .vscode/
 .ipynb_checkpoints/
+
+# Data & outputs (ignore in any folder named like this)
 dataset/
 eval_out/
-notebooks\*.pkl
-notebooks\*.joblib
+
+# Notebook artifacts (binaries)
+notebooks/*.pkl
+notebooks/*.joblib
+notebooks/*.joblib.*
+notebooks/eval_out/
+
+# Optional: ignore any CSVs produced during experiments
+*.tmp.csv
