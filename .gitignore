@@ -19,3 +19,5 @@ notebooks/eval_out/
 
 # Optional: ignore any CSVs produced during experiments
 *.tmp.csv
+
+notebooks/inference_threshold.json
