@@ -1,193 +1,240 @@
-﻿# app.py
-import json
+﻿import json
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+# --- optional plotting (matplotlib) ---
+try:
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except Exception:
+    HAVE_MPL = False
+
 st.set_page_config(page_title="Credit Card Fraud Detection", layout="wide")
 
-# -----------------------------
-# Load pipeline + threshold
-# -----------------------------
-PIPE_PATH = "fraud_pipeline.joblib"
-pipeline = joblib.load(PIPE_PATH)
-
+# ---- Load pipeline and threshold (with fallback key) ----
+pipeline = joblib.load("fraud_pipeline.joblib")
 with open("inference_threshold.json", "r") as f:
     t = json.load(f)
-THRESHOLD = float(t.get("best_threshold", t.get("threshold", 0.5)))
+threshold = t.get("best_threshold", t.get("threshold", 0.5))
 
-st.title("💳 Credit Card Fraud Detection")
+st.title("💳 Credit Card Fraud Detection App")
+st.caption(f"Deployed threshold = **{threshold:.3f}**")
 
-# -----------------------------
-# Determine expected features
-# -----------------------------
-def get_expected_columns_from_pipeline(p):
-    # Works if your ColumnTransformer was saved with verbose_feature_names_out=False
-    try:
-        return list(p.named_steps["prep"].get_feature_names_out())
-    except Exception:
-        pass
-    # Fallback (works for plain sklearn models)
-    return list(getattr(p, "feature_names_in_", []))
+# ---- Determine expected feature columns from the pipeline ----
+expected_cols = []
+try:
+    expected_cols = list(pipeline.named_steps["prep"].get_feature_names_out())
+except Exception:
+    expected_cols = getattr(pipeline, "feature_names_in_", [])
 
-EXPECTED_COLS = get_expected_columns_from_pipeline(pipeline)
-if not EXPECTED_COLS:
-    st.error(
-        "Could not infer feature names from the saved pipeline. "
-        "Please re-save the pipeline with a ColumnTransformer and "
-        "`verbose_feature_names_out=False`, or provide a feature list file."
-    )
+if not expected_cols:
+    st.error("Could not infer feature names from the pipeline. "
+             "Re-save the pipeline with verbose_feature_names_out=False, "
+             "or include a feature list file.")
     st.stop()
 
-# -----------------------------
-# Utilities
-# -----------------------------
-def align_numeric_df(df_in: pd.DataFrame, expected_cols: list[str]) -> pd.DataFrame:
-    """
-    Reindex to expected columns, coerce to numeric, fill missing with 0.
-    Extra columns (not used by the model) are dropped automatically.
-    """
-    df = df_in.copy()
-    # Keep only expected columns (drop extras)
-    df = df.reindex(columns=expected_cols)
-    # Coerce to numeric
-    for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.fillna(0.0)
-    # Order exactly as the model expects
-    return df.loc[:, expected_cols]
-
-def make_manual_row(amount: float,
-                    hour: int,
-                    txn_1h: int,
-                    advanced: dict | None = None) -> pd.DataFrame:
-    """
-    Build a single-row dataframe matching EXPECTED_COLS.
-    Unspecified features default to 0.
-    """
-    row = {c: 0.0 for c in EXPECTED_COLS}
-
+# ---- Helpers ----
+def make_manual_row(amount: float, hour: int, txn_1h: int) -> pd.DataFrame:
+    row = {c: 0.0 for c in expected_cols}
     # Core
     row["amt"] = float(amount)
     row["hour"] = int(hour)
+
+    # Time-derived
+    row["hour_sin"] = np.sin(2*np.pi*hour/24.0)
+    row["hour_cos"] = np.cos(2*np.pi*hour/24.0)
+    row["is_night"] = 1.0 if (hour < 6 or hour >= 22) else 0.0
+    row["is_business_hours"] = 1.0 if (9 <= hour < 17) else 0.0
+
+    dow = 0  # Monday (demo)
+    row["dayofweek"] = float(dow)
+    row["dow_sin"] = np.sin(2*np.pi*dow/7.0)
+    row["dow_cos"] = np.cos(2*np.pi*dow/7.0)
+    row["is_weekend"] = 1.0 if dow in (5, 6) else 0.0
+
+    # Velocity (demo defaults)
     row["txn_count_last_1h"] = float(txn_1h)
+    row.setdefault("total_amt_last_1h", 0.0)
+    row.setdefault("txn_count_last_24h", 0.0)
+    row.setdefault("total_amt_last_24h", 0.0)
+    row.setdefault("time_since_last_txn", 0.0)
+    row.setdefault("transaction_count", 0.0)
 
-    # Cyclic time (if present in your feature set)
-    if "hour_sin" in row: row["hour_sin"] = np.sin(2 * np.pi * hour / 24.0)
-    if "hour_cos" in row: row["hour_cos"] = np.cos(2 * np.pi * hour / 24.0)
-
-    # Night / business hours (if present)
-    if "is_night" in row: row["is_night"] = 1.0 if (hour < 6 or hour >= 22) else 0.0
-    if "is_business_hours" in row: row["is_business_hours"] = 1.0 if (9 <= hour < 17) else 0.0
-
-    # Day-of-week defaults to Monday (0) unless advanced overrides it
-    if "dayofweek" in row and ("dayofweek" not in (advanced or {})):
-        row["dayofweek"] = 0.0
-    if "dow_sin" in row and ("dayofweek" in (advanced or {})):
-        dow = int(advanced["dayofweek"])
-        row["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
-        row["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
-
-    # Apply advanced overrides (only if those columns exist)
-    if advanced:
-        for k, v in advanced.items():
-            if k in row:
-                row[k] = float(v)
+    # Other engineered defaults
+    defaults = {
+        "dayofyear": 1.0, "dist_home_merch": 0.0, "mean_amt": 0.0, "std_amt": 0.0,
+        "median_amt": 0.0, "max_amt": 0.0, "mean_distance": 0.0, "lat": 0.0,
+        "long": 0.0, "city_pop": 0.0, "unix_time": 0.0, "merch_lat": 0.0,
+        "merch_long": 0.0, "merch_zipcode": 0.0, "month": 1.0
+    }
+    for k, v in defaults.items():
+        row.setdefault(k, v)
 
     df = pd.DataFrame([row])
-    return align_numeric_df(df, EXPECTED_COLS)
+    return df.reindex(columns=expected_cols, fill_value=0.0)
 
-def score(df_features: pd.DataFrame) -> np.ndarray:
-    """Return probability of class 1 (fraud)."""
-    return pipeline.predict_proba(df_features)[:, 1]
+def precision_recall_at_thresholds(y_true, y_score, thresholds):
+    """Vectorized prec/rec for a list of thresholds; y_true can be absent (returns None)."""
+    if y_true is None:
+        return None
+    y_true = np.asarray(y_true).astype(int)
+    out = []
+    for thr in thresholds:
+        pred = (y_score >= thr).astype(int)
+        tp = np.sum((pred == 1) & (y_true == 1))
+        fp = np.sum((pred == 1) & (y_true == 0))
+        fn = np.sum((pred == 0) & (y_true == 1))
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        out.append((thr, prec, rec))
+    return pd.DataFrame(out, columns=["threshold", "precision", "recall"])
 
-# =========================================================
-# 1) CSV UPLOAD + SCORING (adds probability + prediction)
-# =========================================================
-st.header("📤 Upload CSV to Score")
+def lift_recall_curve(y_true, y_score):
+    """Compute recall captured vs. top-k% of transactions ranked by score."""
+    if y_true is None:
+        return None
+    y_true = np.asarray(y_true).astype(int)
+    order = np.argsort(-y_score)  # descending
+    y_sorted = y_true[order]
+    cum_tp = np.cumsum(y_sorted)
+    total_pos = y_true.sum()
+    n = len(y_true)
+    k = np.arange(1, n+1)
+    recall = cum_tp / total_pos if total_pos > 0 else np.zeros_like(cum_tp, dtype=float)
+    frac = k / n
+    return pd.DataFrame({"top_fraction": frac, "recall": recall})
 
-uploaded = st.file_uploader(
-    "Upload a CSV whose columns match the engineered features expected by the model.",
-    type=["csv"],
+def top_feature_importances(pipeline, topn=15):
+    try:
+        clf = pipeline.named_steps["clf"]
+        importances = getattr(clf, "feature_importances_", None)
+        if importances is None:
+            return None
+        feat_names = pipeline.named_steps["prep"].get_feature_names_out()
+        df_imp = pd.DataFrame({"feature": feat_names, "importance": importances})
+        df_imp = df_imp.sort_values("importance", ascending=False).head(topn)
+        return df_imp
+    except Exception:
+        return None
+
+# =========================
+# CSV UPLOAD + SCORING
+# =========================
+st.subheader("📤 Upload a CSV")
+uploaded_file = st.file_uploader(
+    "Upload CSV with the engineered feature columns (same schema as training)",
+    type=["csv"]
 )
 
-if uploaded:
-    # Try UTF-8, then Latin-1 on failure
+y_true_available = False
+y_true = None
+proba = None
+out = None
+
+if uploaded_file:
     try:
-        raw = pd.read_csv(uploaded, encoding="utf-8")
+        raw = pd.read_csv(uploaded_file, encoding="utf-8")
     except UnicodeDecodeError:
-        uploaded.seek(0)
-        raw = pd.read_csv(uploaded, encoding="latin1")
+        uploaded_file.seek(0)
+        raw = pd.read_csv(uploaded_file, encoding="latin1")
 
-    # Let the user know if columns are missing; we’ll still fill them with 0’s
-    missing = [c for c in EXPECTED_COLS if c not in raw.columns]
-    extra = [c for c in raw.columns if c not in EXPECTED_COLS]
-    if missing:
-        st.warning(f"{len(missing)} expected columns not found and will be filled with 0: {missing[:10]}{' …' if len(missing)>10 else ''}")
-    if extra:
-        st.info(f"{len(extra)} extra columns will be ignored: {extra[:10]}{' …' if len(extra)>10 else ''}")
+    # Try to capture true labels if present
+    if "is_fraud" in raw.columns:
+        y_true = raw["is_fraud"].values
+        y_true_available = True
 
-    X = align_numeric_df(raw, EXPECTED_COLS)
-    proba = score(X)
-    preds = (proba >= THRESHOLD).astype(int)
+    # Align/Order columns as the model expects; fill missing with 0
+    df = raw.reindex(columns=expected_cols, fill_value=0.0)
+
+    proba = pipeline.predict_proba(df)[:, 1]
+    preds = (proba >= threshold).astype(int)
 
     out = raw.copy()
     out["fraud_probability"] = proba
     out["fraud_prediction"] = preds
 
-    n_fraud = int((out["fraud_prediction"] == 1).sum())
-    st.success(f"Scored {len(out):,} rows — **flagged {n_fraud:,} as fraud** at threshold {THRESHOLD:.3f}.")
+    left, right = st.columns([1, 1])
+    with left:
+        st.success(f"Scored {len(out):,} rows.")
+        st.dataframe(out.head(25), use_container_width=True)
+        st.download_button("⬇️ Download Results", out.to_csv(index=False), "fraud_predictions.csv")
 
-    # Show a small preview
-    st.dataframe(out.head(50), use_container_width=True)
-    st.download_button(
-        "⬇️ Download Results (with predictions)",
-        data=out.to_csv(index=False),
-        file_name="scored_results.csv",
-        mime="text/csv",
-    )
+    # ---------- Charts & diagnostics ----------
+    with right:
+        st.markdown("### 📊 Diagnostics")
 
-st.divider()
+        if HAVE_MPL:
+            # 1) Probability histogram
+            fig, ax = plt.subplots()
+            ax.hist(proba, bins=40)
+            ax.axvline(threshold, linestyle="--")
+            ax.set_title("Fraud Probability Distribution")
+            ax.set_xlabel("Probability")
+            ax.set_ylabel("Count")
+            st.pyplot(fig)
+        else:
+            st.info("Install matplotlib to view charts: `pip install matplotlib`")
 
-# =========================================================
-# 2) MANUAL DEMO CHECK
-# =========================================================
-st.header("🔍 Manual Transaction Check (demo)")
+        # 2) Lift / recall@top-k
+        if y_true_available and proba is not None and HAVE_MPL:
+            curve = lift_recall_curve(y_true, proba)
+            fig2, ax2 = plt.subplots()
+            ax2.plot(curve["top_fraction"] * 100.0, curve["recall"])
+            ax2.set_xlabel("Top % of transactions by score")
+            ax2.set_ylabel("Recall")
+            ax2.set_title("Recall captured vs. Top-% ranked by risk")
+            st.pyplot(fig2)
 
-colA, colB, colC = st.columns(3)
-with colA:
-    amount = st.number_input("Transaction Amount ($)", min_value=0.0, value=5000.0, step=10.0)
-with colB:
+        # 3) Precision/Recall at thresholds
+        if y_true_available and proba is not None:
+            thr_list = np.round(np.linspace(0.05, 0.95, 10), 3)
+            prt = precision_recall_at_thresholds(y_true, proba, thr_list)
+            st.dataframe(prt.style.format({"threshold": "{:.3f}", "precision": "{:.3f}", "recall": "{:.3f}"}),
+                         use_container_width=True)
+
+# Feature importances (global)
+st.write("---")
+st.subheader("🧠 Model Feature Importances")
+imp = top_feature_importances(pipeline, topn=15)
+if imp is None:
+    st.info("Feature importances not available for the loaded model.")
+else:
+    if HAVE_MPL:
+        fig3, ax3 = plt.subplots()
+        ax3.barh(imp["feature"][::-1], imp["importance"][::-1])
+        ax3.set_title("Top Feature Importances")
+        ax3.set_xlabel("Importance")
+        st.pyplot(fig3)
+    st.dataframe(imp, use_container_width=True)
+
+# =========================
+# DEMO: MANUAL SINGLE TXN
+# =========================
+st.write("---")
+st.subheader("🔍 Manual Transaction Check (demo)")
+col1, col2, col3 = st.columns(3)
+with col1:
+    amount = st.number_input("Transaction Amount ($)", min_value=0.0, step=1.0, value=500.0)
+with col2:
     hour = st.slider("Hour of Transaction", 0, 23, 12)
-with colC:
-    txn_1h = st.number_input("Transactions in Last 1h", min_value=0, value=0, step=1)
-
-with st.expander("Advanced signals (optional)"):
-    a1, a2, a3 = st.columns(3)
-    a4, a5, a6 = st.columns(3)
-    a7, a8, a9 = st.columns(3)
-
-    # Only set keys that might actually exist in your feature list
-    adv = {}
-    adv["total_amt_last_24h"] = a1.number_input("Total Amount Last 24h", min_value=0.0, value=0.0, step=100.0)
-    adv["mean_amt"]            = a2.number_input("Mean Amount (user history)", min_value=0.0, value=0.0, step=10.0)
-    adv["std_amt"]             = a3.number_input("Std Amount (user history)", min_value=0.0, value=0.0, step=10.0)
-    adv["median_amt"]          = a4.number_input("Median Amount (user history)", min_value=0.0, value=0.0, step=10.0)
-    adv["max_amt"]             = a5.number_input("Max Amount (user history)", min_value=0.0, value=0.0, step=100.0)
-    adv["city_pop"]            = a6.number_input("City Population", min_value=0.0, value=0.0, step=1000.0)
-    adv["time_since_last_txn"] = a7.number_input("Time Since Last Txn (sec)", min_value=0.0, value=0.0, step=1.0)
-    adv["transaction_count"]   = a8.number_input("Txn Count Last 24h (user)", min_value=0.0, value=0.0, step=1.0)
-    adv["dayofweek"]           = int(a9.selectbox("Day of Week (Mon=0…Sun=6)", list(range(7)), index=0))
-
-    # Remove keys for columns your model doesn't use to keep it clean
-    adv = {k: v for k, v in adv.items() if k in EXPECTED_COLS}
+with col3:
+    txn_count = st.number_input("Transactions in Last 1h", min_value=0, step=1, value=0)
 
 if st.button("Predict Fraud"):
-    sample = make_manual_row(amount, hour, txn_1h, advanced=adv)
-    proba = float(score(sample)[0])
-    label = "Fraud 🚨" if proba >= THRESHOLD else "Legit ✅"
-    st.success(f"**Prediction:** {label} — probability = {proba:.3f} (threshold = {THRESHOLD:.3f})")
+    sample = make_manual_row(amount, hour, txn_count)
+    proba_1 = float(pipeline.predict_proba(sample)[:, 1][0])
+    label = "Fraud 🚨" if proba_1 >= threshold else "Legit ✅"
+    st.success(f"**Prediction:** {label} — probability = {proba_1:.3f} (threshold = {threshold:.3f})")
+
+    if HAVE_MPL:
+        fig4, ax4 = plt.subplots()
+        ax4.hist([proba_1], bins=[0, 0.25, 0.5, 0.75, 1.0], rwidth=0.9)
+        ax4.axvline(threshold, linestyle="--")
+        ax4.set_title("This transaction’s probability bucket")
+        ax4.set_xlabel("Probability")
+        st.pyplot(fig4)
 
     with st.expander("Debug: first 20 features sent to the model"):
-        st.dataframe(sample.iloc[:, :20], use_container_width=True)
+        st.write(sample.reindex(columns=expected_cols).iloc[:, :20])
