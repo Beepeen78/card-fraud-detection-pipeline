@@ -4,3 +4,4 @@ numpy
 joblib
 scikit-learn>=1.5
 lightgbm
+statsmodels>=0.14.0
