@@ -1,271 +1,277 @@
-﻿import json
-import joblib
+﻿# app.py
+import io
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
+import joblib
 
+# Optional: nicer charts with Plotly (falls back to Streamlit charts if not installed)
+try:
+    import plotly.express as px
+except Exception:  # pragma: no cover
+    px = None
+
+# -------------------------------------------------
+# Page setup
+# -------------------------------------------------
 st.set_page_config(
     page_title="Credit Card Fraud Detection",
-    layout="wide",
     page_icon="💳",
+    layout="wide",
 )
 
-# ---------- Small CSS polish ----------
-st.markdown("""
-<style>
-/* wider container and nicer font sizes */
-.block-container { padding-top: 1rem; padding-bottom: 2rem; }
-.kpi-card {
-  border: 1px solid #eaeaea; border-radius: 14px; padding: 16px;
-  background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,0.06);
-}
-.kpi-label { font-size: 0.9rem; color: #6b7280; }
-.kpi-value { font-size: 1.6rem; font-weight: 700; margin-top: 4px; }
-hr { margin: 0.7rem 0 1.2rem 0; }
-</style>
-""", unsafe_allow_html=True)
+st.title("💳 Credit Card Fraud Detection")
+st.caption("Upload engineered transactions (columns matching the training features). The app scores each row and highlights risky ones.")
 
-# ---------- Load model & threshold ----------
-pipeline = joblib.load("fraud_pipeline.joblib")
-with open("inference_threshold.json", "r") as f:
-    t = json.load(f)
-threshold = t.get("best_threshold", t.get("threshold", 0.5))
+# -------------------------------------------------
+# Load model & threshold (cached)
+# -------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def load_pipeline(path: str = "fraud_pipeline.joblib"):
+    return joblib.load(path)
 
-# ---------- Infer expected columns ----------
-try:
-    expected_cols = list(pipeline.named_steps["prep"].get_feature_names_out())
-except Exception:
-    expected_cols = getattr(pipeline, "feature_names_in_", [])
+@st.cache_resource(show_spinner=False)
+def load_threshold(path: str = "inference_threshold.json", default_value: float = 0.5) -> float:
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return float(data.get("best_threshold", data.get("threshold", default_value)))
+    except Exception:
+        return default_value
 
-if not expected_cols:
-    st.error("Could not infer feature names from the pipeline. Re-save with `verbose_feature_names_out=False`.")
+pipeline = load_pipeline()
+THRESHOLD = load_threshold()
+
+# -------------------------------------------------
+# Get expected feature names from the pipeline
+# -------------------------------------------------
+def get_expected_columns_from_pipeline(pl) -> list[str]:
+    # Try ColumnTransformer first (what we saved earlier)
+    try:
+        prep = pl.named_steps.get("prep")
+        if prep is not None:
+            return list(prep.get_feature_names_out())
+    except Exception:
+        pass
+
+    # Fallback to sklearn's feature_names_in_
+    try:
+        return list(pl.feature_names_in_)
+    except Exception:
+        return []
+
+EXPECTED_COLS = get_expected_columns_from_pipeline(pipeline)
+if not EXPECTED_COLS:
+    st.error("❌ Could not infer expected feature columns from the pipeline. "
+             "Please re-save the pipeline with `verbose_feature_names_out=False` or include a feature list.")
     st.stop()
 
-# ---------- Helpers ----------
-def make_manual_row(amount: float, hour: int, txn_1h: int) -> pd.DataFrame:
-    row = {c: 0.0 for c in expected_cols}
-    row["amt"] = float(amount)
-    row["hour"] = int(hour)
-    row["hour_sin"] = np.sin(2*np.pi*hour/24.0)
-    row["hour_cos"] = np.cos(2*np.pi*hour/24.0)
-    row["is_night"] = 1.0 if (hour < 6 or hour >= 22) else 0.0
-    row["is_business_hours"] = 1.0 if (9 <= hour < 17) else 0.0
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+def robust_read_csv(upload) -> pd.DataFrame:
+    """Read CSV with a UTF-8 first, then latin-1 fallback."""
+    try:
+        return pd.read_csv(upload, encoding="utf-8")
+    except UnicodeDecodeError:
+        upload.seek(0)
+        return pd.read_csv(upload, encoding="latin1")
 
-    dow = 0  # Monday
-    row["dayofweek"] = float(dow)
-    row["dow_sin"] = np.sin(2*np.pi*dow/7.0)
-    row["dow_cos"] = np.cos(2*np.pi*dow/7.0)
-    row["is_weekend"] = 1.0 if dow in (5, 6) else 0.0
+def align_to_expected(df_raw: pd.DataFrame, expected_cols: list[str]) -> pd.DataFrame:
+    """Return numeric, ordered frame ready for the pipeline."""
+    # Keep only expected columns for scoring
+    X = df_raw.reindex(columns=expected_cols, fill_value=0)
 
-    row["txn_count_last_1h"] = float(txn_1h)
-    # defaults for velocity/others (safe zeros)
-    defaults = [
-        "total_amt_last_1h","txn_count_last_24h","total_amt_last_24h",
-        "time_since_last_txn","transaction_count","dayofyear","dist_home_merch",
-        "mean_amt","std_amt","median_amt","max_amt","mean_distance","lat",
-        "long","city_pop","unix_time","merch_lat","merch_long",
-        "merch_zipcode","month"
-    ]
-    for c in defaults:
-        row.setdefault(c, 0.0)
-    df = pd.DataFrame([row]).reindex(columns=expected_cols, fill_value=0.0)
-    return df
+    # Coerce everything to numeric if possible
+    for c in X.columns:
+        if not np.issubdtype(X[c].dtype, np.number):
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+    X = X.fillna(0.0)
 
-def kpi_card(label: str, value: float, fmt: str = ".3f"):
-    st.markdown(f"""
-    <div class="kpi-card">
-      <div class="kpi-label">{label}</div>
-      <div class="kpi-value">{value:{fmt}}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Ensure order and dtype
+    X = X.reindex(columns=expected_cols, fill_value=0.0).astype(float)
+    return X
 
-def pr_curve_plot(y_true, y_scores):
-    from sklearn.metrics import precision_recall_curve, average_precision_score
-    precision, recall, thresh = precision_recall_curve(y_true, y_scores)
-    ap = average_precision_score(y_true, y_scores)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=recall, y=precision, mode="lines", name="PR curve"))
-    fig.update_layout(
-        title=f"Precision–Recall Curve (AP = {ap:.3f})",
-        xaxis_title="Recall", yaxis_title="Precision",
-        margin=dict(l=10,r=10,t=40,b=10), height=420
-    )
-    return fig
+def score_dataframe(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Score and return (aligned_scored, original_with_scores)."""
+    X = align_to_expected(df_raw, EXPECTED_COLS)
+    proba = pipeline.predict_proba(X)[:, 1]
+    preds = (proba >= THRESHOLD).astype(int)
 
-def score_df(df: pd.DataFrame):
-    scored = df.reindex(columns=expected_cols, fill_value=0.0)
-    proba = pipeline.predict_proba(scored)[:, 1]
-    preds = (proba >= threshold).astype(int)
-    out = df.copy()
+    X_scored = X.copy()
+    X_scored["fraud_probability"] = proba
+    X_scored["fraud_prediction"] = preds
+
+    out = df_raw.copy()
     out["fraud_probability"] = proba
     out["fraud_prediction"] = preds
-    return out, proba, preds
+    return X_scored, out
 
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.header("⚙️ Settings")
-    st.caption("Model threshold")
-    threshold = st.slider("Decision Threshold", 0.0, 1.0, float(threshold), 0.001)
+def make_sample_template(expected_cols: list[str]) -> pd.DataFrame:
+    """Two-row sample with benign and suspicious patterns using the expected schema."""
+    base = {c: 0 for c in expected_cols}
+
+    # Helper to safely set a value if the column exists
+    def s(d, key, val):
+        if key in d:
+            d[key] = val
+
+    # Row 1: benign-ish, mid-day small amount
+    r1 = base.copy()
+    s(r1, "amt", 35)
+    s(r1, "hour", 11)
+    s(r1, "dayofweek", 2)
+    s(r1, "is_weekend", 0)
+    s(r1, "txn_count_last_1h", 0)
+    s(r1, "total_amt_last_24h", 0)
+    s(r1, "dist_home_merch", 2)
+    s(r1, "city_pop", 50000)
+
+    # Row 2: suspicious, night large amount, recent activity spike
+    r2 = base.copy()
+    s(r2, "amt", 12000)
+    s(r2, "hour", 2)
+    s(r2, "is_weekend", 1)
+    s(r2, "is_night", 1)
+    s(r2, "txn_count_last_1h", 4)
+    s(r2, "total_amt_last_24h", 350000)
+    s(r2, "dist_home_merch", 220)
+    s(r2, "city_pop", 50000)
+    s(r2, "month", 8)
+    s(r2, "dayofweek", 6)
+
+    return pd.DataFrame([r1, r2], columns=expected_cols)
+
+# -------------------------------------------------
+# Header stats bar (empty containers; will populate after scoring)
+# -------------------------------------------------
+stats_cols = st.columns(4)
+box_rows, box_fraud, box_mean, box_thresh = stats_cols
+
+# -------------------------------------------------
+# Upload area
+# -------------------------------------------------
+st.subheader("📤 Upload CSV")
+uploaded = st.file_uploader("Upload a CSV with engineered feature columns", type=["csv"])
+
+with st.expander("📄 Download a sample template", expanded=False):
+    template_df = make_sample_template(EXPECTED_COLS)
+    st.dataframe(template_df.head(10), height=220, use_container_width=True)
+    st.download_button(
+        "Download sample_template.csv",
+        data=template_df.to_csv(index=False).encode("utf-8"),
+        file_name="sample_template.csv",
+        mime="text/csv",
+    )
+    st.caption("Template includes two rows: one benign-like, one suspicious-like.")
+
+# -------------------------------------------------
+# Scoring flow
+# -------------------------------------------------
+if uploaded:
+    df_raw = robust_read_csv(uploaded)
+
+    # Hint user about missing features
+    missing = [c for c in EXPECTED_COLS if c not in df_raw.columns]
+    if missing:
+        st.warning(
+            f"⚠️ {len(missing)} expected feature(s) are missing and will be filled with 0: "
+            + ", ".join(missing[:25])
+            + (" ..." if len(missing) > 25 else "")
+        )
+
+    X_scored, out = score_dataframe(df_raw)
+
+    # Summary metrics
+    rows_scored = len(out)
+    fraud_count = int(out["fraud_prediction"].sum())
+    mean_p = float(out["fraud_probability"].mean()) if rows_scored else 0.0
+
+    box_rows.metric("Rows Scored", f"{rows_scored:,}")
+    box_fraud.metric("Predicted Fraud (count)", f"{fraud_count:,}")
+    box_mean.metric("Mean Fraud Probability", f"{mean_p:0.3f}")
+    box_thresh.metric("Threshold", f"{THRESHOLD:0.3f}")
+
     st.divider()
-    st.caption("Upload data to score, or try manual transaction on the Score tab.")
 
-st.title("💳 Credit Card Fraud Detection")
+    # ---- Results Table(s)
+    st.subheader("🔎 Top Suspicious Transactions")
+    topn = out.sort_values("fraud_probability", ascending=False).head(200)
+    st.dataframe(topn, use_container_width=True, height=280)
 
-tabs = st.tabs(["Score", "Diagnostics", "Feature Insights"])
+    st.download_button(
+        "⬇️ Download Scored CSV",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name="fraud_predictions_scored.csv",
+        mime="text/csv",
+    )
 
-# =========================
-# TAB 1 — SCORE
-# =========================
-with tabs[0]:
-    left, right = st.columns([1.3, 1])
+    st.divider()
 
-    with left:
-        st.subheader("📤 Upload CSV")
-        up = st.file_uploader("Upload engineered feature table (.csv)", type=["csv"])
-        if up:
-            try:
-                raw = pd.read_csv(up)
-            except UnicodeDecodeError:
-                up.seek(0)
-                raw = pd.read_csv(up, encoding="latin1")
+    # ---- Charts
+    st.subheader("📊 Visual Insights")
 
-            out, proba, preds = score_df(raw)
+    c1, c2 = st.columns(2)
 
-            # KPI row
-            st.write("")
-            c1, c2, c3 = st.columns(3)
-            with c1: kpi_card("Rows Scored", len(out), ".0f")
-            with c2: kpi_card("Predicted Fraud (count)", int((out["fraud_prediction"]==1).sum()), ".0f")
-            with c3: kpi_card("Mean Fraud Probability", float(out["fraud_probability"].mean()), ".3f")
-
-            st.write("")
-            st.dataframe(out.head(25), use_container_width=True)
-            st.download_button("⬇️ Download Scored CSV", out.to_csv(index=False), "fraud_predictions.csv")
-
-            # Quick class distribution & prob hist
-            st.write("")
-            ch1, ch2 = st.columns(2)
-            with ch1:
-                bar = px.histogram(out, x="fraud_prediction", text_auto=True)
-                bar.update_layout(title="Predicted Class Distribution", xaxis_title="Prediction", yaxis_title="Count", height=360, margin=dict(l=10,r=10,t=40,b=10))
-                st.plotly_chart(bar, use_container_width=True)
-            with ch2:
-                hist = px.histogram(out, x="fraud_probability", nbins=40)
-                hist.update_layout(title="Fraud Probability Histogram", xaxis_title="Probability", yaxis_title="Count", height=360, margin=dict(l=10,r=10,t=40,b=10))
-                st.plotly_chart(hist, use_container_width=True)
-
-    with right:
-        st.subheader("🔍 Manual Transaction (demo)")
-        amount = st.number_input("Amount ($)", min_value=0.0, step=1.0, value=1200.0)
-        hour   = st.slider("Hour (0–23)", 0, 23, 23)
-        txn_1h = st.number_input("Txn Count (last 1h)", min_value=0, step=1, value=3)
-
-        if st.button("Predict Fraud", type="primary"):
-            sample = make_manual_row(amount, hour, txn_1h)
-            prob = float(pipeline.predict_proba(sample)[:, 1][0])
-            label = "Fraud 🚨" if prob >= threshold else "Legit ✅"
-
-            c1, c2 = st.columns([1,1])
-            with c1: kpi_card("Probability", prob)
-            with c2: kpi_card("Threshold", threshold)
-
-            st.success(f"**Prediction:** {label}")
-            st.caption("First 20 features sent to the model")
-            st.dataframe(sample.iloc[:, :20], use_container_width=True, height=240)
-
-# =========================
-# TAB 2 — DIAGNOSTICS
-# =========================
-with tabs[1]:
-    st.subheader("📊 Diagnostics (needs labeled data)")
-    lab_file = st.file_uploader("Upload CSV with **is_fraud** column to view PR/Lift curves", type=["csv"], key="diag")
-    if lab_file:
-        try:
-            lab_raw = pd.read_csv(lab_file)
-        except UnicodeDecodeError:
-            lab_file.seek(0); lab_raw = pd.read_csv(lab_file, encoding="latin1")
-
-        if "is_fraud" not in lab_raw.columns:
-            st.error("The file must include an `is_fraud` column.")
+    # Probability distribution
+    with c1:
+        st.markdown("**Fraud probability distribution**")
+        if px is not None:
+            fig = px.histogram(out, x="fraud_probability", nbins=40, opacity=0.85)
+            fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=320)
+            st.plotly_chart(fig, use_container_width=True)
         else:
-            out, proba, preds = score_df(lab_raw)
-            y_true = lab_raw["is_fraud"].astype(int).values
+            st.bar_chart(np.histogram(out["fraud_probability"], bins=40)[0])
 
-            # KPIs at current threshold
+    # Amount vs probability (if amt exists)
+    with c2:
+        if "amt" in out.columns:
+            st.markdown("**Amount vs. Probability**")
+            if px is not None:
+                fig = px.scatter(
+                    out,
+                    x="amt",
+                    y="fraud_probability",
+                    opacity=0.7,
+                    trendline="lowess",
+                )
+                fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=320)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.line_chart(out[["amt", "fraud_probability"]])
+        else:
+            st.info("Column `amt` not found; skipping amount/probability chart.")
+
+    # Hour-wise mean probability (if hour exists)
+    if "hour" in out.columns:
+        st.markdown("**Average fraud probability by hour**")
+        hour_agg = out.groupby("hour", dropna=False)["fraud_probability"].mean().reset_index()
+        if px is not None:
+            fig = px.bar(hour_agg, x="hour", y="fraud_probability")
+            fig.update_layout(margin=dict(l=0, r=0, t=10, b=10), height=320)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.bar_chart(hour_agg.set_index("hour"))
+
+    # If labels present, show quick precision/recall/F1
+    if "is_fraud" in out.columns:
+        try:
             from sklearn.metrics import precision_score, recall_score, f1_score
-            pr = float(precision_score(y_true, preds, zero_division=0))
-            rc = float(recall_score(y_true, preds, zero_division=0))
-            f1 = float(f1_score(y_true, preds, zero_division=0))
 
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: kpi_card("Rows", len(out), ".0f")
-            with c2: kpi_card("Precision", pr)
-            with c3: kpi_card("Recall", rc)
-            with c4: kpi_card("F1", f1)
+            p = precision_score(out["is_fraud"], out["fraud_prediction"], zero_division=0)
+            r = recall_score(out["is_fraud"], out["fraud_prediction"], zero_division=0)
+            f1 = f1_score(out["is_fraud"], out["fraud_prediction"], zero_division=0)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Precision", f"{p:0.3f}")
+            m2.metric("Recall", f"{r:0.3f}")
+            m3.metric("F1", f"{f1:0.3f}")
+        except Exception:
+            st.info("`is_fraud` present but could not compute metrics (sklearn missing?).")
 
-            # PR curve
-            st.plotly_chart(pr_curve_plot(y_true, proba), use_container_width=True)
+    with st.expander("🛠️ Debug / Scoring matrix"):
+        st.caption("Aligned matrix sent to the model (first rows).")
+        st.dataframe(X_scored.head(20), use_container_width=True, height=260)
 
-            # Confusion matrix bar
-            tn = int(((preds==0) & (y_true==0)).sum())
-            fp = int(((preds==1) & (y_true==0)).sum())
-            fn = int(((preds==0) & (y_true==1)).sum())
-            tp = int(((preds==1) & (y_true==1)).sum())
-            cm_df = pd.DataFrame({"count":[tn, fp, fn, tp]},
-                                 index=["TN","FP","FN","TP"]).reset_index()
-            cm_fig = px.bar(cm_df, x="index", y="count", text_auto=True,
-                            title="Confusion Matrix (counts)")
-            cm_fig.update_layout(height=360, margin=dict(l=10,r=10,t=40,b=10))
-            st.plotly_chart(cm_fig, use_container_width=True)
-
-# =========================
-# TAB 3 — FEATURE INSIGHTS
-# =========================
-with tabs[2]:
-    st.subheader("🧠 Feature Insights")
-    st.caption("Top features by permutation importance (approximate)")
-
-    # quick, model-agnostic permutation importance on a tiny random sample
-    demo_rows = st.slider("Rows to sample for importance (performance vs. accuracy)", 300, 5000, 1000, 100)
-    random_state = 13
-
-    @st.cache_data(show_spinner=True)
-    def compute_permutation_importance(n_rows: int, seed: int):
-        # Create a synthetic batch with plausible ranges to avoid needing a real CSV
-        rng = np.random.default_rng(seed)
-        Xsyn = pd.DataFrame(0.0, index=np.arange(n_rows), columns=expected_cols)
-        # set a few realistic ranges for known features
-        if "amt" in Xsyn: Xsyn["amt"] = rng.uniform(1, 2000, n_rows)
-        if "hour" in Xsyn: Xsyn["hour"] = rng.integers(0, 24, n_rows)
-        if "txn_count_last_1h" in Xsyn: Xsyn["txn_count_last_1h"] = rng.integers(0, 6, n_rows)
-        if "total_amt_last_24h" in Xsyn: Xsyn["total_amt_last_24h"] = rng.uniform(0, 5000, n_rows)
-        if "dist_home_merch" in Xsyn: Xsyn["dist_home_merch"] = rng.uniform(0, 500, n_rows)
-        # fill cyc features from hour if present
-        if "hour_sin" in Xsyn and "hour" in Xsyn:
-            Xsyn["hour_sin"] = np.sin(2*np.pi*Xsyn["hour"]/24.0)
-        if "hour_cos" in Xsyn and "hour" in Xsyn:
-            Xsyn["hour_cos"] = np.cos(2*np.pi*Xsyn["hour"]/24.0)
-
-        base = pipeline.predict_proba(Xsyn)[:,1]
-        base_var = np.var(base)
-        scores = []
-        for c in expected_cols[:60]:  # cap to keep it fast on big models
-            Xperm = Xsyn.copy()
-            rng.shuffle(Xperm[c].values)
-            alt = pipeline.predict_proba(Xperm)[:,1]
-            drop = max(base_var - np.var(alt), 0.0)
-            scores.append((c, float(drop)))
-        imp = pd.DataFrame(scores, columns=["feature","importance"]).sort_values("importance", ascending=False)
-        return imp
-
-    imp_df = compute_permutation_importance(demo_rows, random_state)
-    st.dataframe(imp_df.head(25), use_container_width=True, height=420)
-    fig_imp = px.bar(imp_df.head(25), x="importance", y="feature", orientation="h")
-    fig_imp.update_layout(title="Top Features (Permutation Importance, proxy)",
-                          height=700, margin=dict(l=10,r=10,t=40,b=10))
-    st.plotly_chart(fig_imp, use_container_width=True)
-
-st.divider()
-st.caption("Tip: Use the sidebar to change threshold and re-evaluate precision/recall instantly.")
+else:
+    st.info("Upload a CSV to score transactions. Or download the sample template above to try.")
