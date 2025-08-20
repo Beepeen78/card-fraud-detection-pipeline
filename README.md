@@ -15,3 +15,7 @@ git clone https://github.com/Beepeen78/card-fraud-detection-pipeline.git
 cd card-fraud-detection-pipeline
 pip install -r requirements.txt
 streamlit run app.py
+
+## 🚀 Live Demo
+[Click here to try the app]
+https://card-fraud-detection-pipeline-drwqmciycbaewrk7r4kzqh.streamlit.app/
