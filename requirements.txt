@@ -6,3 +6,4 @@ scikit-learn>=1.5
 lightgbm
 statsmodels>=0.14.0
 matplotlib
+Plotly==5.22.0
