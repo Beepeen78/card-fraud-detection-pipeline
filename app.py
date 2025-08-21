@@ -1,193 +1,442 @@
 ﻿# app.py
+# -----------------------------
+# Credit Card Fraud Detection – Streamlit App
+# - Loads trained pipeline (LightGBM inside)
+# - Auto-engineers missing features for raw CSVs
+# - Aligns columns to model expectations
+# - Scores, explains, and visualizes
+# -----------------------------
+
+from __future__ import annotations
+
+import io
 import json
+from pathlib import Path
+from typing import List, Tuple, Optional
+
 import joblib
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="Credit Card Fraud Detection", layout="wide")
+# ------------- Page config -------------
+st.set_page_config(
+    page_title="Credit Card Fraud Detection",
+    page_icon="💳",
+    layout="wide",
+)
 
-# -----------------------------
-# Load pipeline + threshold
-# -----------------------------
-PIPE_PATH = "fraud_pipeline.joblib"
-pipeline = joblib.load(PIPE_PATH)
+# ------------- Constants -------------
+MODEL_PATHS = [
+    Path("fraud_pipeline.joblib"),
+    Path("notebooks/fraud_pipeline.joblib"),
+]
+THRESHOLD_PATHS = [
+    Path("inference_threshold.json"),
+    Path("notebooks/inference_threshold.json"),
+]
 
-with open("inference_threshold.json", "r") as f:
-    t = json.load(f)
-THRESHOLD = float(t.get("best_threshold", t.get("threshold", 0.5)))
+# Raw columns the app will look for when auto-engineering features
+RAW_TIME_COLS = [
+    "trans_date_trans_time", "transaction_time", "timestamp", "datetime"
+]
+RAW_AMOUNT_COLS = ["amt", "amount", "transaction_amount"]
+RAW_ID_COLS = ["trans_num", "transaction_id", "id"]
+RAW_CC_COLS = ["cc_num", "customer_id", "cust_id", "user_id"]
 
-st.title("💳 Credit Card Fraud Detection")
+# Distance (haversine) columns
+LAT_HOME_COLS = ["lat", "home_lat"]
+LON_HOME_COLS = ["long", "home_long", "lng"]
+LAT_MERCH_COLS = ["merch_lat", "merchant_lat"]
+LON_MERCH_COLS = ["merch_long", "merchant_long", "merch_lng"]
+ZIP_MERCH_COLS = ["merch_zipcode", "merchant_zip"]
 
-# -----------------------------
-# Determine expected features
-# -----------------------------
-def get_expected_columns_from_pipeline(p):
-    # Works if your ColumnTransformer was saved with verbose_feature_names_out=False
+# ------------- Cached loaders -------------
+@st.cache_resource(show_spinner=False)
+def load_pipeline() -> object:
+    for p in MODEL_PATHS:
+        if p.exists():
+            return joblib.load(p)
+    st.error("❌ Could not find `fraud_pipeline.joblib` (root or notebooks/).")
+    st.stop()
+
+
+@st.cache_resource(show_spinner=False)
+def load_threshold() -> float:
+    for p in THRESHOLD_PATHS:
+        if p.exists():
+            obj = json.loads(Path(p).read_text())
+            return float(obj.get("best_threshold", obj.get("threshold", 0.5)))
+    return 0.5
+
+
+@st.cache_resource(show_spinner=False)
+def load_expected_feature_list(_pipeline) -> List[str]:
+    """
+    Try to discover the model's expected feature list in a robust order:
+      1) feature_columns.pkl (root or notebooks)
+      2) ColumnTransformer.get_feature_names_out() if available
+      3) estimator.feature_names_in_ if available
+
+    NOTE: `_pipeline` has a leading underscore so Streamlit won't try to hash it.
+    """
+    for p in [Path("feature_columns.pkl"), Path("notebooks/feature_columns.pkl")]:
+        if p.exists():
+            try:
+                cols = joblib.load(p)
+                if isinstance(cols, (list, np.ndarray, pd.Index)):
+                    return list(cols)
+            except Exception:
+                pass
+
     try:
-        return list(p.named_steps["prep"].get_feature_names_out())
+        if hasattr(_pipeline, "named_steps") and "prep" in _pipeline.named_steps:
+            cols = _pipeline.named_steps["prep"].get_feature_names_out()
+            return list(cols)
     except Exception:
         pass
-    # Fallback (works for plain sklearn models)
-    return list(getattr(p, "feature_names_in_", []))
 
-EXPECTED_COLS = get_expected_columns_from_pipeline(pipeline)
-if not EXPECTED_COLS:
+    try:
+        cols = getattr(_pipeline, "feature_names_in_", None)
+        if cols is not None:
+            return list(cols)
+    except Exception:
+        pass
+
     st.error(
-        "Could not infer feature names from the saved pipeline. "
-        "Please re-save the pipeline with a ColumnTransformer and "
-        "`verbose_feature_names_out=False`, or provide a feature list file."
+        "❌ Unable to infer expected feature columns. "
+        "Please save `feature_columns.pkl` during training or ensure your pipeline "
+        "exposes column names via a ColumnTransformer."
     )
     st.stop()
 
-# -----------------------------
-# Utilities
-# -----------------------------
-def align_numeric_df(df_in: pd.DataFrame, expected_cols: list[str]) -> pd.DataFrame:
-    """
-    Reindex to expected columns, coerce to numeric, fill missing with 0.
-    Extra columns (not used by the model) are dropped automatically.
-    """
-    df = df_in.copy()
-    # Keep only expected columns (drop extras)
-    df = df.reindex(columns=expected_cols)
-    # Coerce to numeric
-    for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.fillna(0.0)
-    # Order exactly as the model expects
-    return df.loc[:, expected_cols]
 
-def make_manual_row(amount: float,
-                    hour: int,
-                    txn_1h: int,
-                    advanced: dict | None = None) -> pd.DataFrame:
-    """
-    Build a single-row dataframe matching EXPECTED_COLS.
-    Unspecified features default to 0.
-    """
-    row = {c: 0.0 for c in EXPECTED_COLS}
+# ------------- Feature engineering helpers -------------
+def _first_present(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
-    # Core
-    row["amt"] = float(amount)
-    row["hour"] = int(hour)
-    row["txn_count_last_1h"] = float(txn_1h)
 
-    # Cyclic time (if present in your feature set)
-    if "hour_sin" in row: row["hour_sin"] = np.sin(2 * np.pi * hour / 24.0)
-    if "hour_cos" in row: row["hour_cos"] = np.cos(2 * np.pi * hour / 24.0)
+def _ensure_datetime(df: pd.DataFrame) -> Optional[pd.Series]:
+    tcol = _first_present(df, RAW_TIME_COLS)
+    if tcol is None:
+        return None
+    s = pd.to_datetime(df[tcol], errors="coerce", infer_datetime_format=True, utc=False)
+    if s.notna().sum() == 0:
+        try:
+            s = pd.to_datetime(df[tcol], unit="s", errors="coerce")
+        except Exception:
+            pass
+    return s
 
-    # Night / business hours (if present)
-    if "is_night" in row: row["is_night"] = 1.0 if (hour < 6 or hour >= 22) else 0.0
-    if "is_business_hours" in row: row["is_business_hours"] = 1.0 if (9 <= hour < 17) else 0.0
 
-    # Day-of-week defaults to Monday (0) unless advanced overrides it
-    if "dayofweek" in row and ("dayofweek" not in (advanced or {})):
-        row["dayofweek"] = 0.0
-    if "dow_sin" in row and ("dayofweek" in (advanced or {})):
-        dow = int(advanced["dayofweek"])
-        row["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
-        row["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
+def _haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = (lat2 - lat1)
+    dlon = (lon2 - lon1)
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    c = 2 * np.arcsin(np.sqrt(a))
+    return R * c
 
-    # Apply advanced overrides (only if those columns exist)
-    if advanced:
-        for k, v in advanced.items():
-            if k in row:
-                row[k] = float(v)
 
-    df = pd.DataFrame([row])
-    return align_numeric_df(df, EXPECTED_COLS)
+def basic_feature_engineering(raw: pd.DataFrame) -> pd.DataFrame:
+    df = raw.copy()
 
-def score(df_features: pd.DataFrame) -> np.ndarray:
-    """Return probability of class 1 (fraud)."""
-    return pipeline.predict_proba(df_features)[:, 1]
+    # ---- Amount ----
+    a_col = _first_present(df, RAW_AMOUNT_COLS)
+    if a_col and "amt" not in df.columns:
+        df["amt"] = pd.to_numeric(df[a_col], errors="coerce").fillna(0.0)
+    elif "amt" not in df.columns:
+        df["amt"] = 0.0
 
-# =========================================================
-# 1) CSV UPLOAD + SCORING (adds probability + prediction)
-# =========================================================
-st.header("📤 Upload CSV to Score")
+    # ---- ID columns ----
+    id_col = _first_present(df, RAW_ID_COLS)
+    if id_col and "trans_num" not in df.columns:
+        df["trans_num"] = df[id_col].astype(str)
+    elif "trans_num" not in df.columns:
+        df["trans_num"] = np.arange(len(df)).astype(str)
 
-uploaded = st.file_uploader(
-    "Upload a CSV whose columns match the engineered features expected by the model.",
-    type=["csv"],
-)
+    cc_col = _first_present(df, RAW_CC_COLS)
+    if cc_col and "cc_num" not in df.columns:
+        df["cc_num"] = df[cc_col]
+    elif "cc_num" not in df.columns:
+        df["cc_num"] = 0
 
-if uploaded:
-    # Try UTF-8, then Latin-1 on failure
-    try:
-        raw = pd.read_csv(uploaded, encoding="utf-8")
-    except UnicodeDecodeError:
-        uploaded.seek(0)
-        raw = pd.read_csv(uploaded, encoding="latin1")
+    # ---- Time features ----
+    t_series = _ensure_datetime(df)
+    if t_series is None:
+        df["hour"] = 0.0
+        df["dayofweek"] = 0.0
+        df["month"] = 1.0
+        df["is_weekend"] = 0.0
+        df["is_night"] = 0.0
+        df["is_business_hours"] = 1.0
+        df["hour_sin"] = 0.0
+        df["hour_cos"] = 1.0
+        df["dow_sin"] = 0.0
+        df["dow_cos"] = 1.0
+        df["dayofyear"] = 1.0
+        df["unix_time"] = 0.0
+    else:
+        df["hour"] = t_series.dt.hour.astype(float)
+        df["dayofweek"] = t_series.dt.dayofweek.astype(float)
+        df["month"] = t_series.dt.month.astype(float)
+        df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(float)
+        df["is_night"] = ((df["hour"] < 6) | (df["hour"] >= 22)).astype(float)
+        df["is_business_hours"] = ((df["hour"] >= 9) & (df["hour"] < 17)).astype(float)
+        df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
+        df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
+        df["dow_sin"] = np.sin(2 * np.pi * df["dayofweek"] / 7.0)
+        df["dow_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7.0)
+        df["dayofyear"] = t_series.dt.dayofyear.astype(float)
+        try:
+            df["unix_time"] = (t_series.view("int64") // 10**9).astype(float)
+        except Exception:
+            df["unix_time"] = t_series.astype("int64", errors="ignore") // 10**9
 
-    # Let the user know if columns are missing; we’ll still fill them with 0’s
-    missing = [c for c in EXPECTED_COLS if c not in raw.columns]
-    extra = [c for c in raw.columns if c not in EXPECTED_COLS]
-    if missing:
-        st.warning(f"{len(missing)} expected columns not found and will be filled with 0: {missing[:10]}{' …' if len(missing)>10 else ''}")
-    if extra:
-        st.info(f"{len(extra)} extra columns will be ignored: {extra[:10]}{' …' if len(extra)>10 else ''}")
+    # ---- Geo/distance ----
+    lat_h = _first_present(df, LAT_HOME_COLS)
+    lon_h = _first_present(df, LON_HOME_COLS)
+    lat_m = _first_present(df, LAT_MERCH_COLS)
+    lon_m = _first_present(df, LON_MERCH_COLS)
 
-    X = align_numeric_df(raw, EXPECTED_COLS)
-    proba = score(X)
-    preds = (proba >= THRESHOLD).astype(int)
+    for c in ["lat", "long", "merch_lat", "merch_long"]:
+        if c not in df.columns:
+            df[c] = 0.0
+    if lat_h and "lat" not in raw.columns:
+        df["lat"] = pd.to_numeric(df[lat_h], errors="coerce").fillna(0.0)
+    if lon_h and "long" not in raw.columns:
+        df["long"] = pd.to_numeric(df[lon_h], errors="coerce").fillna(0.0)
+    if lat_m and "merch_lat" not in raw.columns:
+        df["merch_lat"] = pd.to_numeric(df[lat_m], errors="coerce").fillna(0.0)
+    if lon_m and "merch_long" not in raw.columns:
+        df["merch_long"] = pd.to_numeric(df[lon_m], errors="coerce").fillna(0.0)
 
-    out = raw.copy()
-    out["fraud_probability"] = proba
-    out["fraud_prediction"] = preds
-
-    n_fraud = int((out["fraud_prediction"] == 1).sum())
-    st.success(f"Scored {len(out):,} rows — **flagged {n_fraud:,} as fraud** at threshold {THRESHOLD:.3f}.")
-
-    # Show a small preview
-    st.dataframe(out.head(50), use_container_width=True)
-    st.download_button(
-        "⬇️ Download Results (with predictions)",
-        data=out.to_csv(index=False),
-        file_name="scored_results.csv",
-        mime="text/csv",
+    df["dist_home_merch"] = _haversine(
+        df["lat"].astype(float),
+        df["long"].astype(float),
+        df["merch_lat"].astype(float),
+        df["merch_long"].astype(float),
     )
 
-st.divider()
+    # Zip defaults if required by pipeline
+    zipm = _first_present(df, ZIP_MERCH_COLS)
+    if "merch_zipcode" not in df.columns:
+        if zipm is not None:
+            df["merch_zipcode"] = pd.to_numeric(df[zipm], errors="coerce").fillna(0.0)
+        else:
+            df["merch_zipcode"] = 0.0
 
-# =========================================================
-# 2) MANUAL DEMO CHECK
-# =========================================================
-st.header("🔍 Manual Transaction Check (demo)")
+    # ---- Per-card aggregates (windowless proxies) ----
+    g = df.groupby("cc_num", dropna=False)["amt"]
+    df["mean_amt"] = g.transform("mean").fillna(0.0)
+    df["std_amt"] = g.transform("std").fillna(0.0)
+    df["median_amt"] = g.transform("median").fillna(0.0)
+    df["max_amt"] = g.transform("max").fillna(0.0)
+    df["mean_distance"] = df.groupby("cc_num", dropna=False)["dist_home_merch"].transform("mean").fillna(0.0)
+    df["transaction_count"] = df.groupby("cc_num", dropna=False)["amt"].transform("count").fillna(0.0)
 
-colA, colB, colC = st.columns(3)
-with colA:
-    amount = st.number_input("Transaction Amount ($)", min_value=0.0, value=5000.0, step=10.0)
-with colB:
-    hour = st.slider("Hour of Transaction", 0, 23, 12)
-with colC:
-    txn_1h = st.number_input("Transactions in Last 1h", min_value=0, value=0, step=1)
+    # ---- Velocity features (coarse but effective) ----
+    if _ensure_datetime(df) is not None:
+        df = df.sort_values(["cc_num", "unix_time"], kind="mergesort")
+        df["time_since_last_txn"] = df.groupby("cc_num")["unix_time"].diff().fillna(0.0)
 
-with st.expander("Advanced signals (optional)"):
-    a1, a2, a3 = st.columns(3)
-    a4, a5, a6 = st.columns(3)
-    a7, a8, a9 = st.columns(3)
+        grp = df.groupby("cc_num", group_keys=False)
+        df["txn_count_last_1h"] = grp["unix_time"].apply(
+            lambda s: pd.Series((s.values[:, None] - s.values[None, :] <= 3600).sum(axis=1), index=s.index)
+        ).astype("float32")
+        df["txn_count_last_24h"] = grp["unix_time"].apply(
+            lambda s: pd.Series((s.values[:, None] - s.values[None, :] <= 86400).sum(axis=1), index=s.index)
+        ).astype("float32")
 
-    # Only set keys that might actually exist in your feature list
-    adv = {}
-    adv["total_amt_last_24h"] = a1.number_input("Total Amount Last 24h", min_value=0.0, value=0.0, step=100.0)
-    adv["mean_amt"]            = a2.number_input("Mean Amount (user history)", min_value=0.0, value=0.0, step=10.0)
-    adv["std_amt"]             = a3.number_input("Std Amount (user history)", min_value=0.0, value=0.0, step=10.0)
-    adv["median_amt"]          = a4.number_input("Median Amount (user history)", min_value=0.0, value=0.0, step=10.0)
-    adv["max_amt"]             = a5.number_input("Max Amount (user history)", min_value=0.0, value=0.0, step=100.0)
-    adv["city_pop"]            = a6.number_input("City Population", min_value=0.0, value=0.0, step=1000.0)
-    adv["time_since_last_txn"] = a7.number_input("Time Since Last Txn (sec)", min_value=0.0, value=0.0, step=1.0)
-    adv["transaction_count"]   = a8.number_input("Txn Count Last 24h (user)", min_value=0.0, value=0.0, step=1.0)
-    adv["dayofweek"]           = int(a9.selectbox("Day of Week (Mon=0…Sun=6)", list(range(7)), index=0))
+        amt = df["amt"].astype(float).values
+        df["total_amt_last_1h"] = grp["unix_time"].apply(
+            lambda s: pd.Series(((s.values[:, None] - s.values[None, :] <= 3600) * amt[s.index]).sum(axis=1), index=s.index)
+        ).astype("float32")
+        df["total_amt_last_24h"] = grp["unix_time"].apply(
+            lambda s: pd.Series(((s.values[:, None] - s.values[None, :] <= 86400) * amt[s.index]).sum(axis=1), index=s.index)
+        ).astype("float32")
+    else:
+        df["time_since_last_txn"] = 0.0
+        df["txn_count_last_1h"] = 0.0
+        df["txn_count_last_24h"] = 0.0
+        df["total_amt_last_1h"] = 0.0
+        df["total_amt_last_24h"] = 0.0
 
-    # Remove keys for columns your model doesn't use to keep it clean
-    adv = {k: v for k, v in adv.items() if k in EXPECTED_COLS}
+    # Final hygiene
+    for c in df.columns:
+        if df[c].dtype == "O" and c not in {"trans_num"}:
+            try:
+                df[c] = pd.to_numeric(df[c], errors="ignore")
+            except Exception:
+                pass
+    return df
 
-if st.button("Predict Fraud"):
-    sample = make_manual_row(amount, hour, txn_1h, advanced=adv)
-    proba = float(score(sample)[0])
-    label = "Fraud 🚨" if proba >= THRESHOLD else "Legit ✅"
-    st.success(f"**Prediction:** {label} — probability = {proba:.3f} (threshold = {THRESHOLD:.3f})")
 
-    with st.expander("Debug: first 20 features sent to the model"):
-        st.dataframe(sample.iloc[:, :20], use_container_width=True)
+def align_to_expected(df_feat: pd.DataFrame, expected_cols: List[str]) -> pd.DataFrame:
+    aligned = df_feat.reindex(columns=expected_cols, fill_value=0.0)
+    for c in aligned.columns:
+        if aligned[c].dtype == "O":
+            aligned[c] = pd.to_numeric(aligned[c], errors="coerce").fillna(0.0)
+    return aligned
+
+
+# ------------- Scoring -------------
+def score_dataframe(
+    df_raw: pd.DataFrame,
+    pipeline,
+    expected_cols: List[str],
+    threshold: float
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df_feat = basic_feature_engineering(df_raw)
+    model_df = align_to_expected(df_feat, expected_cols)
+
+    try:
+        proba = pipeline.predict_proba(model_df)[:, 1]
+    except Exception as e:
+        st.exception(e)
+        st.stop()
+    preds = (proba >= threshold).astype(int)
+
+    out = df_raw.copy()
+    out["fraud_probability"] = proba
+    out["fraud_prediction"] = preds
+    return out, model_df
+
+
+# ------------- UI -------------
+st.title("💳 Credit Card Fraud Detection")
+
+with st.sidebar:
+    st.header("Model")
+    pipeline = load_pipeline()
+    threshold = load_threshold()
+    st.markdown(f"**Decision threshold:** `{threshold:.3f}`")
+    exp_cols = load_expected_feature_list(pipeline)
+    st.caption(f"Model expects **{len(exp_cols)}** features.")
+
+st.subheader("📤 Upload CSV")
+uploaded = st.file_uploader(
+    "Upload raw transactions (no need to pre-engineer). CSV only.",
+    type=["csv"],
+    help="The app will auto-engineer time/geo/velocity features, align to the trained model, and score.",
+)
+
+# Sample template download
+template_cols = ["transaction_id", "trans_date_trans_time", "cc_num", "amount", "lat", "long", "merch_lat", "merch_long"]
+buf = io.StringIO()
+pd.DataFrame(columns=template_cols).to_csv(buf, index=False)
+st.download_button("📄 Download a sample template", buf.getvalue(), "sample_template.csv", use_container_width=False)
+
+if uploaded is None:
+    st.info("Upload a CSV to start scoring. Keep at least a timestamp, amount, and some IDs for better features.")
+    st.stop()
+
+# Read uploaded
+try:
+    df_in = pd.read_csv(uploaded)
+except UnicodeDecodeError:
+    uploaded.seek(0)
+    df_in = pd.read_csv(uploaded, encoding="latin1")
+
+# Score
+with st.spinner("Scoring…"):
+    scored, X_model = score_dataframe(df_in, pipeline, exp_cols, threshold)
+
+# KPIs
+total_rows = len(scored)
+fraud_count = int(scored["fraud_prediction"].sum())
+mean_prob = float(scored["fraud_probability"].mean())
+
+k1, k2, k3 = st.columns(3)
+k1.metric("Rows Scored", f"{total_rows:,}")
+k2.metric("Predicted Fraud (count)", f"{fraud_count:,}")
+k3.metric("Mean Fraud Probability", f"{mean_prob:.3f}")
+
+# ----------------- Top suspicious table (safe: no duplicate column names) -----------------
+st.subheader("🔎 Top Suspicious Transactions")
+topn = scored.nlargest(200, "fraud_probability").copy()
+
+id_actual   = _first_present(scored, RAW_ID_COLS) or "trans_num"
+amt_actual  = _first_present(scored, RAW_AMOUNT_COLS) or "amt"
+cc_actual   = _first_present(scored, RAW_CC_COLS) or "cc_num"
+hour_actual = "hour" if "hour" in scored.columns else None
+label_actual = "is_fraud" if "is_fraud" in scored.columns else None
+
+pairs = [
+    ("transaction_id", id_actual),
+    ("amount", amt_actual),
+    ("hour", hour_actual),
+    ("customer_id", cc_actual),
+    ("is_fraud", label_actual),
+    ("fraud_probability", "fraud_probability"),
+    ("fraud_prediction", "fraud_prediction"),
+]
+pairs = [(lbl, col) for (lbl, col) in pairs if col is not None]
+
+seen_actual = set()
+safe_pairs = []
+for lbl, col in pairs:
+    if col not in seen_actual:
+        safe_pairs.append((lbl, col))
+        seen_actual.add(col)
+
+disp = topn[[col for _, col in safe_pairs]].copy()
+rename_map = {col: lbl for (lbl, col) in safe_pairs}
+disp = disp.rename(columns=rename_map)
+
+st.dataframe(disp, use_container_width=True, height=420)
+# ------------------------------------------------------------------------------------------
+
+# Download scored results
+csv_io = io.StringIO()
+scored.to_csv(csv_io, index=False)
+st.download_button(
+    "💾 Download Scored CSV",
+    csv_io.getvalue(),
+    file_name="scored_transactions.csv",
+    use_container_width=False,
+)
+
+# Visuals
+st.subheader("📊 Visual Insights")
+
+c1, c2 = st.columns(2)
+with c1:
+    fig = px.histogram(scored, x="fraud_probability", nbins=40, title="Fraud Probability Distribution")
+    fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), bargap=0.05)
+    st.plotly_chart(fig, use_container_width=True)
+
+with c2:
+    # ---- SAFE scatter: color derived from the *same* sampled frame ----
+    amt_col = _first_present(scored, RAW_AMOUNT_COLS) or "amt"
+    sample = scored.sample(min(len(scored), 5000), random_state=42).copy()
+    sample["pred_label"] = sample["fraud_prediction"].map({0: "Legit", 1: "Fraud"}).astype("category")
+
+    fig2 = px.scatter(
+        sample,
+        x=amt_col,
+        y="fraud_probability",
+        color="pred_label",
+        opacity=0.6,
+        title="Amount vs Probability",
+        category_orders={"pred_label": ["Legit", "Fraud"]},
+        labels={"pred_label": "Prediction"},
+    )
+    fig2.update_layout(margin=dict(l=10, r=10, t=40, b=10), legend_title_text="Prediction")
+    st.plotly_chart(fig2, use_container_width=True)
+
+# Explain simple drivers (non-SHAP, safe & fast)
+if "amt" in scored.columns and "fraud_probability" in scored.columns:
+    st.subheader("⚙️ Simple Drivers (univariate)")
+    amt_q = pd.qcut(scored["amt"], q=10, duplicates="drop")
+    by_bucket = scored.groupby(amt_q)["fraud_probability"].mean().reset_index()
+    fig3 = px.bar(by_bucket, x="amt", y="fraud_probability", title="Avg Fraud Prob by Amount Decile")
+    fig3.update_layout(margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig3, use_container_width=True)
+
+st.caption("Tip: If predictions look off on *raw* data, include timestamp and per-card history so auto-engineering can build better velocity features.")

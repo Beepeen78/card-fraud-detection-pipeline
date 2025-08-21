@@ -1,0 +1,25 @@
+{
+  "rows": 1296675,
+  "flags_total": 7107,
+  "flag_rate": 0.00548094163919255,
+  "tier_counts": {
+    "allow": 1289568,
+    "block": 5742,
+    "review": 1365
+  },
+  "policy": {
+    "block": 0.9,
+    "review": 0.6,
+    "allow": 0.0
+  },
+  "month": "2020-06",
+  "roc_auc": 0.5002885709476085,
+  "pr_auc": 0.005819889887955773,
+  "precision_at_policy": 0.006331785563528915,
+  "recall_at_policy": 0.005995203836930456,
+  "threshold_suggestion": {
+    "block": 1.0,
+    "review": 0.5,
+    "allow": 0.0
+  }
+}

@@ -4,4 +4,8 @@ numpy
 joblib
 scikit-learn>=1.5
 lightgbm
+<<<<<<< HEAD
 statsmodels>=0.14.0
+=======
+matplotlib
+>>>>>>> feature/streamlit-app

@@ -1,25 +1,35 @@
-# Python / OS / IDE
+﻿# Python
 __pycache__/
 *.pyc
-.venv/
-.DS_Store
-.idea/
-.vscode/
+*.pyo
+*.pyd
+*.egg-info/
 .ipynb_checkpoints/
 
-# Data & outputs (ignore in any folder named like this)
+# Virtual envs
+.venv/
+venv/
+
+# Streamlit cache
+.streamlit/
+**/.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (keep sample CSVs elsewhere)
+data/
 dataset/
+*.parquet
+*.feather
+*.sqlite
+*.db
+*.zip
+
+# Large artifacts you don’t want on Git
+*.log
 eval_out/
-
-# Notebook artifacts (binaries)
-notebooks/*.pkl
-notebooks/*.joblib
-notebooks/*.joblib.*
-notebooks/eval_out/
-
-# Optional: ignore any CSVs produced during experiments
-*.tmp.csv
-
-notebooks/inference_threshold.json
-
-notebooks/eda_and_feature_engineering.ipynb
+monitoring/
+*.bak
+*backup_*.py
