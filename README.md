@@ -18,4 +18,4 @@ streamlit run app.py
 
 ## 🚀 Live Demo
 [Click here to try the app]
-https://card-fraud-detection-pipeline-drwqmciycbaewrk7r4kzqh.streamlit.app/
+https://card-fraud-detection-pipeline-ewap9jamdwal7twcdgad7i.streamlit.app/
