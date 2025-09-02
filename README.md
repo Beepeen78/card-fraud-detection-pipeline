@@ -1,3 +1,4 @@
+Live demo: https://card-fraud-detection-pipeline-ewap9jamdwal7twcdgad7i.streamlit.app/
 # 💳 Credit Card Fraud Detection Pipeline
 
 End-to-end machine learning pipeline + Streamlit app to detect fraudulent credit card transactions.
