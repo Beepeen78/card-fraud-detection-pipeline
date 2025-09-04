@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-predict_fraud_batch.py  (auto-feature + safe alignment)
+predict_fraud_batch.py  (auto-feature + safe alignment + friendlier errors)
 
 Usage (Windows PowerShell):
   python predict_fraud_batch.py `
@@ -11,7 +11,7 @@ Usage (Windows PowerShell):
     --id_col trans_num
 """
 
-import argparse, json
+import argparse, json, sys
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -19,7 +19,7 @@ import joblib
 
 DEFAULT_POLICY = {"block": 0.90, "review": 0.60}
 
-# --- CONFIG (adjust if needed) ---
+# --- CONFIG defaults (override via CLI if desired) ---
 ID_COL   = "cc_num"                   # default ID column used for rolling features
 TIME_COL = "trans_date_trans_time"
 AMT_COL  = "amt"
@@ -40,25 +40,23 @@ def haversine(lat1, lon1, lat2, lon2):
     return 6371.0 * 2.0 * np.arcsin(np.sqrt(a))  # km
 
 def _group_apply(df, key, func):
-    """pandas compatibility: try include_groups=False if available."""
     try:
         return df.groupby(key, group_keys=False).apply(func, include_groups=False)
     except TypeError:
         return df.groupby(key, group_keys=False).apply(func)
 
 # ---------- feature builder ----------
-def build_features(df: pd.DataFrame, want_cols: set) -> pd.DataFrame:
-    """Build ONLY the features present in want_cols (subset-safe)."""
+def build_features(df: pd.DataFrame, want_cols: set, id_col: str = ID_COL, time_col: str = TIME_COL) -> pd.DataFrame:
     d = df.copy()
-    if TIME_COL in d.columns:
-        d[TIME_COL] = pd.to_datetime(d[TIME_COL], errors="coerce")
-    d = d.sort_values([c for c in [ID_COL, TIME_COL] if c in d.columns]).reset_index(drop=True)
+    if time_col in d.columns:
+        d[time_col] = pd.to_datetime(d[time_col], errors="coerce")
+    d = d.sort_values([c for c in [id_col, time_col] if c in d.columns]).reset_index(drop=True)
 
     # time parts
-    if "hour" in want_cols and TIME_COL in d.columns:         d["hour"] = d[TIME_COL].dt.hour
-    if "dayofweek" in want_cols and TIME_COL in d.columns:    d["dayofweek"] = d[TIME_COL].dt.dayofweek
-    if "dayofyear" in want_cols and TIME_COL in d.columns:    d["dayofyear"] = d[TIME_COL].dt.dayofyear
-    if "month" in want_cols and TIME_COL in d.columns:        d["month"] = d[TIME_COL].dt.month
+    if "hour" in want_cols and time_col in d.columns:         d["hour"] = d[time_col].dt.hour
+    if "dayofweek" in want_cols and time_col in d.columns:    d["dayofweek"] = d[time_col].dt.dayofweek
+    if "dayofyear" in want_cols and time_col in d.columns:    d["dayofyear"] = d[time_col].dt.dayofyear
+    if "month" in want_cols and time_col in d.columns:        d["month"] = d[time_col].dt.month
     if "is_weekend" in want_cols and "dayofweek" in d.columns:
         d["is_weekend"] = d["dayofweek"].isin([5, 6]).astype(int)
     if "is_night" in want_cols and "hour" in d.columns:
@@ -75,21 +73,21 @@ def build_features(df: pd.DataFrame, want_cols: set) -> pd.DataFrame:
         d["dist_home_merch"] = haversine(d["lat"], d["long"], d["merch_lat"], d["merch_long"])
 
     # user-level rolling features
-    if ID_COL in d.columns and TIME_COL in d.columns:
+    if id_col in d.columns and time_col in d.columns:
         if "time_since_last_txn" in want_cols:
-            d["time_since_last_txn"] = d.groupby(ID_COL)[TIME_COL].diff().dt.total_seconds().fillna(0)
+            d["time_since_last_txn"] = d.groupby(id_col)[time_col].diff().dt.total_seconds().fillna(0)
         if "transaction_count" in want_cols:
-            d["transaction_count"] = d.groupby(ID_COL).cumcount() + 1
+            d["transaction_count"] = d.groupby(id_col).cumcount() + 1
         if AMT_COL in d.columns:
-            g_amt = d.groupby(ID_COL)[AMT_COL]
+            g_amt = d.groupby(id_col)[AMT_COL]
             if "mean_amt" in want_cols:   d["mean_amt"]   = g_amt.transform(lambda x: x.rolling(50, min_periods=1).mean())
             if "std_amt" in want_cols:    d["std_amt"]    = g_amt.transform(lambda x: x.rolling(50, min_periods=2).std().fillna(0))
             if "median_amt" in want_cols: d["median_amt"] = g_amt.transform(lambda x: x.rolling(50, min_periods=1).median())
             if "max_amt" in want_cols:    d["max_amt"]    = g_amt.transform(lambda x: x.rolling(50, min_periods=1).max())
         if "mean_distance" in want_cols and "dist_home_merch" in d.columns:
-            d["mean_distance"] = d.groupby(ID_COL)["dist_home_merch"].transform(lambda x: x.rolling(50, min_periods=1).mean())
+            d["mean_distance"] = d.groupby(id_col)["dist_home_merch"].transform(lambda x: x.rolling(50, min_periods=1).mean())
         if AMT_COL in d.columns:
-            d["_ts"] = d[TIME_COL].astype("int64") // 10**9
+            d["_ts"] = d[time_col].astype("int64") // 10**9
             def window(sub, sec, prefix):
                 t = sub["_ts"].to_numpy(); a = sub[AMT_COL].to_numpy(); n = len(sub)
                 cnt = np.zeros(n, dtype=np.int32); tot = np.zeros(n, dtype=float); j = 0
@@ -101,10 +99,10 @@ def build_features(df: pd.DataFrame, want_cols: set) -> pd.DataFrame:
             need1  = {"txn_count_last_1h",  "total_amt_last_1h"}  & want_cols
             need24 = {"txn_count_last_24h", "total_amt_last_24h"} & want_cols
             if need1:
-                tmp = _group_apply(d, ID_COL, lambda sub: window(sub, 3600, "1h"))
+                tmp = _group_apply(d, id_col, lambda sub: window(sub, 3600, "1h"))
                 for c in need1:  d[c] = tmp[c]
             if need24:
-                tmp = _group_apply(d, ID_COL, lambda sub: window(sub, 86400, "24h"))
+                tmp = _group_apply(d, id_col, lambda sub: window(sub, 86400, "24h"))
                 for c in need24: d[c] = tmp[c]
             d.drop(columns=["_ts"], errors="ignore", inplace=True)
 
@@ -117,7 +115,6 @@ def build_features(df: pd.DataFrame, want_cols: set) -> pd.DataFrame:
         bins = [-np.inf, 1, 10, 50, 100, np.inf]
         d["dist_category_bucket_idx"] = pd.cut(d["dist_home_merch"].fillna(-1), bins=bins, labels=False)
 
-    # drop obvious labels if present
     d.drop(columns=[c for c in ["is_fraud","label","target","Class"] if c in d.columns],
            errors="ignore", inplace=True)
     return d
@@ -157,6 +154,9 @@ def main():
     args = ap.parse_args()
 
     art = Path(args.artifacts_dir)
+    if not art.exists():
+        print(f"❌ artifacts_dir not found: {art}", file=sys.stderr)
+        sys.exit(2)
     policy = load_policy(art / "operating_policy.json")
 
     pipe_path  = art / "fraud_pipeline.joblib"
@@ -164,56 +164,67 @@ def main():
     base_path  = art / "fraud_lgbm_model.pkl"
     cols_pkl   = art / "feature_columns.pkl"
 
-    df_raw = pd.read_csv(args.input)
+    try:
+        df_raw = pd.read_csv(args.input)
+    except Exception as e:
+        print(f"❌ Failed to read input CSV: {e}", file=sys.stderr)
+        sys.exit(2)
 
     used = None
     y_prob = None
 
     if pipe_path.exists():
-        # Try pipeline directly on raw columns
-        pipe = joblib.load(pipe_path)
         try:
-            X_try = df_raw.drop(columns=[c for c in ["is_fraud","label","target","Class"] if c in df_raw.columns],
-                                errors="ignore")
-            y_prob = pipe.predict_proba(X_try)[:, 1]
-            used = "pipeline"
-        except Exception:
-            # Build a broad feature set and try again (covers both 25-col and 38-col schemas)
-            common_cols = {
-                "amt","city_pop","dayofweek","dayofyear","dist_category_bucket_idx","dist_home_merch",
-                "dow_cos","dow_sin","hour","hour_cos","hour_sin","is_business_hours","is_night","is_weekend",
-                "max_amt","mean_amt","median_amt","month","std_amt","time_since_last_txn",
-                "total_amt_last_1h","total_amt_last_24h","transaction_count","txn_count_last_1h","txn_count_last_24h",
-                "mean_distance","gender_bin"
-            }
-            Xb = build_features(df_raw, common_cols)
-            y_prob = pipe.predict_proba(Xb)[:, 1]
-            used = "pipeline(features)"
+            pipe = joblib.load(pipe_path)
+        except Exception as e:
+            print(f"⚠️ Failed loading pipeline: {e}; will try model-only path.", file=sys.stderr)
+            pipe = None
+        if pipe is not None:
+            try:
+                X_try = df_raw.drop(columns=[c for c in ["is_fraud","label","target","Class"] if c in df_raw.columns],
+                                    errors="ignore")
+                y_prob = pipe.predict_proba(X_try)[:, 1]
+                used = "pipeline"
+            except Exception:
+                # Build a broader feature set and try again (covers 25/38-col schemas)
+                common_cols = {
+                    "amt","city_pop","dayofweek","dayofyear","dist_category_bucket_idx","dist_home_merch",
+                    "dow_cos","dow_sin","hour","hour_cos","hour_sin","is_business_hours","is_night","is_weekend",
+                    "max_amt","mean_amt","median_amt","month","std_amt","time_since_last_txn",
+                    "total_amt_last_1h","total_amt_last_24h","transaction_count","txn_count_last_1h","txn_count_last_24h",
+                    "mean_distance","gender_bin"
+                }
+                Xb = build_features(df_raw, common_cols)
+                try:
+                    y_prob = pipe.predict_proba(Xb)[:, 1]
+                    used = "pipeline(features)"
+                except Exception as e:
+                    print(f"⚠️ Pipeline inference failed even with engineered features: {e}", file=sys.stderr)
 
     if y_prob is None:
         # Use model directly with strict column alignment
-        model = joblib.load(calib_path) if calib_path.exists() else joblib.load(base_path)
-        expected = expected_from_model(model)
-        if not expected and cols_pkl.exists():
-            expected = list(joblib.load(cols_pkl))
+        model_path = calib_path if calib_path.exists() else base_path
+        if not model_path.exists():
+            print("❌ No pipeline or model artifacts found (expected fraud_pipeline.joblib or fraud_lgbm_*.pkl in artifacts_dir).", file=sys.stderr)
+            sys.exit(2)
+        model = joblib.load(model_path)
+        expected = expected_from_model(model) or (list(joblib.load(cols_pkl)) if cols_pkl.exists() else [])
         if not expected:
-            raise RuntimeError("Cannot determine expected feature names (model & feature_columns.pkl missing).")
+            print("❌ Cannot determine expected feature names (model and feature_columns.pkl missing).", file=sys.stderr)
+            sys.exit(2)
 
         Xb = build_features(df_raw, set(expected))
         Xb = align_numeric(Xb, expected)
 
-        # sanity log
-        if len(expected) != Xb.shape[1]:
-            print(f"WARNING: expected {len(expected)} features, got {Xb.shape[1]}")
         missing = [c for c in expected if c not in Xb.columns]
         extra   = [c for c in Xb.columns if c not in expected]
         if missing or extra:
-            print("Missing (filled):", missing[:5], " Extra (dropped):", extra[:5])
+            print(f"ℹ️ Alignment -> Missing filled: {len(missing)}, Extra dropped: {len(extra)}")
 
         y_prob = model.predict_proba(Xb)[:, 1]
-        used = "calibrated" if calib_path.exists() else "base"
+        used = "calibrated" if "calibrated" in model_path.name else "base"
 
-    def tier(p): 
+    def tier(p):
         return "block" if p >= policy["block"] else ("review" if p >= policy["review"] else "allow")
 
     out = pd.DataFrame({"fraud_probability": y_prob,

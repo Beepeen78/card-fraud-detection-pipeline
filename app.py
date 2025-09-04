@@ -1,442 +1,231 @@
-﻿# app.py
-# -----------------------------
-# Credit Card Fraud Detection – Streamlit App
-# - Loads trained pipeline (LightGBM inside)
-# - Auto-engineers missing features for raw CSVs
-# - Aligns columns to model expectations
-# - Scores, explains, and visualizes
-# -----------------------------
 
+# app.py — Patched: builds minimal engineered features so raw CSVs work
 from __future__ import annotations
-
-import io
-import json
+import os
 from pathlib import Path
-from typing import List, Tuple, Optional
-
-import joblib
+from datetime import datetime
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
+import plotly.express as px
+import joblib
+from google.cloud import bigquery
 
-# ------------- Page config -------------
-st.set_page_config(
-    page_title="Credit Card Fraud Detection",
-    page_icon="💳",
-    layout="wide",
-)
+st.set_page_config(page_title="Credit Card Fraud – Scoring", layout="wide")
 
-# ------------- Constants -------------
-MODEL_PATHS = [
-    Path("fraud_pipeline.joblib"),
-    Path("notebooks/fraud_pipeline.joblib"),
-]
-THRESHOLD_PATHS = [
-    Path("inference_threshold.json"),
-    Path("notebooks/inference_threshold.json"),
-]
+MODEL_PATH = Path("fraud_pipeline.joblib")
+PBI_OUT_DIR = Path("powerbi/out"); PBI_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Raw columns the app will look for when auto-engineering features
-RAW_TIME_COLS = [
-    "trans_date_trans_time", "transaction_time", "timestamp", "datetime"
-]
-RAW_AMOUNT_COLS = ["amt", "amount", "transaction_amount"]
-RAW_ID_COLS = ["trans_num", "transaction_id", "id"]
-RAW_CC_COLS = ["cc_num", "customer_id", "cust_id", "user_id"]
+BQ_PROJECT   = os.getenv("BQ_PROJECT", "credit-card-fraud-pipeline")
+BQ_DATASET   = os.getenv("BQ_DATASET", "fraud_prod")
+BQ_TABLE_TX  = f"{BQ_PROJECT}.{BQ_DATASET}.transactions_scored"
+BQ_TABLE_MET = f"{BQ_PROJECT}.{BQ_DATASET}.metrics_daily"
 
-# Distance (haversine) columns
-LAT_HOME_COLS = ["lat", "home_lat"]
-LON_HOME_COLS = ["long", "home_long", "lng"]
-LAT_MERCH_COLS = ["merch_lat", "merchant_lat"]
-LON_MERCH_COLS = ["merch_long", "merchant_long", "merch_lng"]
-ZIP_MERCH_COLS = ["merch_zipcode", "merchant_zip"]
-
-# ------------- Cached loaders -------------
-@st.cache_resource(show_spinner=False)
-def load_pipeline() -> object:
-    for p in MODEL_PATHS:
-        if p.exists():
-            return joblib.load(p)
-    st.error("❌ Could not find `fraud_pipeline.joblib` (root or notebooks/).")
-    st.stop()
-
+ID_CANDS   = ["transaction_id","trans_num","id"]
+CC_CANDS   = ["cc_num","customer_id","cust_id","user_id"]
+AMT_CANDS  = ["amount","amt","transaction_amount"]
+TS_CANDS   = ["trans_date_trans_time","timestamp","datetime","transaction_time"]
+LABELS     = ["is_fraud","label","target","Class"]
 
 @st.cache_resource(show_spinner=False)
-def load_threshold() -> float:
-    for p in THRESHOLD_PATHS:
-        if p.exists():
-            obj = json.loads(Path(p).read_text())
-            return float(obj.get("best_threshold", obj.get("threshold", 0.5)))
-    return 0.5
-
-
-@st.cache_resource(show_spinner=False)
-def load_expected_feature_list(_pipeline) -> List[str]:
-    """
-    Try to discover the model's expected feature list in a robust order:
-      1) feature_columns.pkl (root or notebooks)
-      2) ColumnTransformer.get_feature_names_out() if available
-      3) estimator.feature_names_in_ if available
-
-    NOTE: `_pipeline` has a leading underscore so Streamlit won't try to hash it.
-    """
-    for p in [Path("feature_columns.pkl"), Path("notebooks/feature_columns.pkl")]:
-        if p.exists():
-            try:
-                cols = joblib.load(p)
-                if isinstance(cols, (list, np.ndarray, pd.Index)):
-                    return list(cols)
-            except Exception:
-                pass
-
+def load_pipe():
+    pipe = joblib.load(MODEL_PATH)
+    exp = None
     try:
-        if hasattr(_pipeline, "named_steps") and "prep" in _pipeline.named_steps:
-            cols = _pipeline.named_steps["prep"].get_feature_names_out()
-            return list(cols)
+        if hasattr(pipe,"named_steps") and "prep" in pipe.named_steps:
+            exp = list(pipe.named_steps["prep"].get_feature_names_out())
     except Exception:
         pass
+    if exp is None and hasattr(pipe,"feature_names_in_"):
+        exp = list(pipe.feature_names_in_)
+    return pipe, exp
 
-    try:
-        cols = getattr(_pipeline, "feature_names_in_", None)
-        if cols is not None:
-            return list(cols)
-    except Exception:
-        pass
-
-    st.error(
-        "❌ Unable to infer expected feature columns. "
-        "Please save `feature_columns.pkl` during training or ensure your pipeline "
-        "exposes column names via a ColumnTransformer."
-    )
-    st.stop()
-
-
-# ------------- Feature engineering helpers -------------
-def _first_present(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    for c in candidates:
-        if c in df.columns:
-            return c
+def first(df, cols):
+    for c in cols:
+        if c in df.columns: return c
     return None
 
-
-def _ensure_datetime(df: pd.DataFrame) -> Optional[pd.Series]:
-    tcol = _first_present(df, RAW_TIME_COLS)
-    if tcol is None:
-        return None
-    s = pd.to_datetime(df[tcol], errors="coerce", infer_datetime_format=True, utc=False)
-    if s.notna().sum() == 0:
-        try:
-            s = pd.to_datetime(df[tcol], unit="s", errors="coerce")
-        except Exception:
-            pass
-    return s
-
-
-def _haversine(lat1, lon1, lat2, lon2):
+def haversine_km(lat1, lon1, lat2, lon2):
+    # vectorized haversine
     R = 6371.0
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    dlat = (lat2 - lat1)
-    dlon = (lon2 - lon1)
-    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-    c = 2 * np.arcsin(np.sqrt(a))
-    return R * c
+    lat1 = np.radians(lat1); lon1 = np.radians(lon1)
+    lat2 = np.radians(lat2); lon2 = np.radians(lon2)
+    dlat = lat2 - lat1; dlon = lon2 - lon1
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
+    return 2*R*np.arcsin(np.sqrt(a))
 
+def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Create a broad set of engineered features w/ safe defaults.
+       Rolling/TE features that require history are set to 0.
+    """
+    df = df_raw.copy()
 
-def basic_feature_engineering(raw: pd.DataFrame) -> pd.DataFrame:
-    df = raw.copy()
+    # Core column names
+    id_col  = first(df, ID_CANDS)  or "transaction_id"
+    cc_col  = first(df, CC_CANDS)  or "cc_num"
+    amt_col = first(df, AMT_CANDS) or "amount"
+    ts_col  = first(df, TS_CANDS)  or "trans_date_trans_time"
 
-    # ---- Amount ----
-    a_col = _first_present(df, RAW_AMOUNT_COLS)
-    if a_col and "amt" not in df.columns:
-        df["amt"] = pd.to_numeric(df[a_col], errors="coerce").fillna(0.0)
-    elif "amt" not in df.columns:
-        df["amt"] = 0.0
+    if id_col not in df.columns:
+        df[id_col] = np.arange(len(df)).astype(str)
 
-    # ---- ID columns ----
-    id_col = _first_present(df, RAW_ID_COLS)
-    if id_col and "trans_num" not in df.columns:
-        df["trans_num"] = df[id_col].astype(str)
-    elif "trans_num" not in df.columns:
-        df["trans_num"] = np.arange(len(df)).astype(str)
+    # Coerce
+    df[amt_col] = pd.to_numeric(df.get(amt_col, 0.0), errors="coerce").fillna(0.0)
+    ts = pd.to_datetime(df.get(ts_col, datetime.utcnow()), errors="coerce", utc=True)
+    df["unix_time"] = (ts.view("int64") // 10**9).astype("int64")
+    df["hour"]      = ts.dt.hour.fillna(0).astype(int)
+    df["dayofweek"] = ts.dt.dayofweek.fillna(0).astype(int)
+    df["dayofyear"] = ts.dt.dayofyear.fillna(1).astype(int)
 
-    cc_col = _first_present(df, RAW_CC_COLS)
-    if cc_col and "cc_num" not in df.columns:
-        df["cc_num"] = df[cc_col]
-    elif "cc_num" not in df.columns:
-        df["cc_num"] = 0
+    # Geo
+    lat = pd.to_numeric(df.get("lat", 0), errors="coerce").fillna(0.0)
+    lon = pd.to_numeric(df.get("long", 0), errors="coerce").fillna(0.0)
+    mlat= pd.to_numeric(df.get("merch_lat", 0), errors="coerce").fillna(0.0)
+    mlon= pd.to_numeric(df.get("merch_long", 0), errors="coerce").fillna(0.0)
 
-    # ---- Time features ----
-    t_series = _ensure_datetime(df)
-    if t_series is None:
-        df["hour"] = 0.0
-        df["dayofweek"] = 0.0
-        df["month"] = 1.0
-        df["is_weekend"] = 0.0
-        df["is_night"] = 0.0
-        df["is_business_hours"] = 1.0
-        df["hour_sin"] = 0.0
-        df["hour_cos"] = 1.0
-        df["dow_sin"] = 0.0
-        df["dow_cos"] = 1.0
-        df["dayofyear"] = 1.0
-        df["unix_time"] = 0.0
+    df["mean_distance"]   = haversine_km(lat, lon, mlat, mlon)
+    df["dist_home_merch"] = df["mean_distance"]  # proxy if no home coords
+
+    # Sine/cosine time encodings
+    df["hour_sin"] = np.sin(2*np.pi*df["hour"]/24)
+    df["hour_cos"] = np.cos(2*np.pi*df["hour"]/24)
+    df["dow_sin"]  = np.sin(2*np.pi*df["dayofweek"]/7)
+    df["dow_cos"]  = np.cos(2*np.pi*df["dayofweek"]/7)
+
+    # Flags
+    df["is_weekend"] = df["dayofweek"].isin([5,6]).astype(int)
+    df["is_night"]   = ((df["hour"] < 6) | (df["hour"] >= 22)).astype(int)
+    df["is_business_hours"] = df["hour"].between(9,17).astype(int)
+
+    # Basic amt stats per row (fallbacks; real training used windows)
+    df["max_amt"]    = df[amt_col]
+    df["median_amt"] = df[amt_col]
+    df["std_amt"]    = 0.0
+    df["mean_amt"]   = df[amt_col]
+
+    # Window features (no history in single file) -> zeros
+    for c in [
+        "txn_count_last_1h","txn_count_last_24h","txn_count_last_1h_category",
+        "txn_count_last_24h_category","total_amt_last_1h","total_amt_last_24h",
+        "total_amt_last_1h_category","total_amt_last_24h_category",
+        "time_since_last_txn","transaction_count"
+    ]:
+        df[c] = 0.0
+
+    # Simple categorical encodings (fallbacks)
+    if "gender" in df.columns:
+        df["gender_bin"] = df["gender"].astype(str).str.lower().map({"m":1,"male":1,"f":0,"female":0}).fillna(0).astype(int)
     else:
-        df["hour"] = t_series.dt.hour.astype(float)
-        df["dayofweek"] = t_series.dt.dayofweek.astype(float)
-        df["month"] = t_series.dt.month.astype(float)
-        df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(float)
-        df["is_night"] = ((df["hour"] < 6) | (df["hour"] >= 22)).astype(float)
-        df["is_business_hours"] = ((df["hour"] >= 9) & (df["hour"] < 17)).astype(float)
-        df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
-        df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
-        df["dow_sin"] = np.sin(2 * np.pi * df["dayofweek"] / 7.0)
-        df["dow_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7.0)
-        df["dayofyear"] = t_series.dt.dayofyear.astype(float)
-        try:
-            df["unix_time"] = (t_series.view("int64") // 10**9).astype(float)
-        except Exception:
-            df["unix_time"] = t_series.astype("int64", errors="ignore") // 10**9
+        df["gender_bin"] = 0
 
-    # ---- Geo/distance ----
-    lat_h = _first_present(df, LAT_HOME_COLS)
-    lon_h = _first_present(df, LON_HOME_COLS)
-    lat_m = _first_present(df, LAT_MERCH_COLS)
-    lon_m = _first_present(df, LON_MERCH_COLS)
+    # Distance category / job target-encoding placeholders
+    df["te_dist_category"] = 0.0
+    df["te_job"] = 0.0
 
-    for c in ["lat", "long", "merch_lat", "merch_long"]:
-        if c not in df.columns:
-            df[c] = 0.0
-    if lat_h and "lat" not in raw.columns:
-        df["lat"] = pd.to_numeric(df[lat_h], errors="coerce").fillna(0.0)
-    if lon_h and "long" not in raw.columns:
-        df["long"] = pd.to_numeric(df[lon_h], errors="coerce").fillna(0.0)
-    if lat_m and "merch_lat" not in raw.columns:
-        df["merch_lat"] = pd.to_numeric(df[lat_m], errors="coerce").fillna(0.0)
-    if lon_m and "merch_long" not in raw.columns:
-        df["merch_long"] = pd.to_numeric(df[lon_m], errors="coerce").fillna(0.0)
+    # Direct passthroughs if present
+    for passthru in ["city_pop","merch_zipcode","month"]:
+        if passthru not in df.columns: df[passthru] = 0
 
-    df["dist_home_merch"] = _haversine(
-        df["lat"].astype(float),
-        df["long"].astype(float),
-        df["merch_lat"].astype(float),
-        df["merch_long"].astype(float),
-    )
+    # Ensure original needed columns are present
+    if "amt" not in df.columns: df["amt"] = df[amt_col]
 
-    # Zip defaults if required by pipeline
-    zipm = _first_present(df, ZIP_MERCH_COLS)
-    if "merch_zipcode" not in df.columns:
-        if zipm is not None:
-            df["merch_zipcode"] = pd.to_numeric(df[zipm], errors="coerce").fillna(0.0)
-        else:
-            df["merch_zipcode"] = 0.0
-
-    # ---- Per-card aggregates (windowless proxies) ----
-    g = df.groupby("cc_num", dropna=False)["amt"]
-    df["mean_amt"] = g.transform("mean").fillna(0.0)
-    df["std_amt"] = g.transform("std").fillna(0.0)
-    df["median_amt"] = g.transform("median").fillna(0.0)
-    df["max_amt"] = g.transform("max").fillna(0.0)
-    df["mean_distance"] = df.groupby("cc_num", dropna=False)["dist_home_merch"].transform("mean").fillna(0.0)
-    df["transaction_count"] = df.groupby("cc_num", dropna=False)["amt"].transform("count").fillna(0.0)
-
-    # ---- Velocity features (coarse but effective) ----
-    if _ensure_datetime(df) is not None:
-        df = df.sort_values(["cc_num", "unix_time"], kind="mergesort")
-        df["time_since_last_txn"] = df.groupby("cc_num")["unix_time"].diff().fillna(0.0)
-
-        grp = df.groupby("cc_num", group_keys=False)
-        df["txn_count_last_1h"] = grp["unix_time"].apply(
-            lambda s: pd.Series((s.values[:, None] - s.values[None, :] <= 3600).sum(axis=1), index=s.index)
-        ).astype("float32")
-        df["txn_count_last_24h"] = grp["unix_time"].apply(
-            lambda s: pd.Series((s.values[:, None] - s.values[None, :] <= 86400).sum(axis=1), index=s.index)
-        ).astype("float32")
-
-        amt = df["amt"].astype(float).values
-        df["total_amt_last_1h"] = grp["unix_time"].apply(
-            lambda s: pd.Series(((s.values[:, None] - s.values[None, :] <= 3600) * amt[s.index]).sum(axis=1), index=s.index)
-        ).astype("float32")
-        df["total_amt_last_24h"] = grp["unix_time"].apply(
-            lambda s: pd.Series(((s.values[:, None] - s.values[None, :] <= 86400) * amt[s.index]).sum(axis=1), index=s.index)
-        ).astype("float32")
-    else:
-        df["time_since_last_txn"] = 0.0
-        df["txn_count_last_1h"] = 0.0
-        df["txn_count_last_24h"] = 0.0
-        df["total_amt_last_1h"] = 0.0
-        df["total_amt_last_24h"] = 0.0
-
-    # Final hygiene
-    for c in df.columns:
-        if df[c].dtype == "O" and c not in {"trans_num"}:
-            try:
-                df[c] = pd.to_numeric(df[c], errors="ignore")
-            except Exception:
-                pass
     return df
 
+def build_metrics_daily(scored: pd.DataFrame) -> pd.DataFrame:
+    scored = scored.copy()
+    scored["date"] = pd.to_datetime(scored["score_time"], utc=True).dt.date
+    out = (
+        scored.groupby("date", as_index=False)
+        .agg(
+            transactions=("transaction_id","count"),
+            flagged=("fraud_prediction","sum"),
+            avg_risk=("fraud_probability","mean"),
+            total_amount=("amount","sum"),
+            actual_fraud=("is_fraud","sum")
+        )
+    )
+    out["transactions"]=out["transactions"].astype("int64")
+    out["flagged"]=out["flagged"].astype("int64")
+    out["actual_fraud"]=out["actual_fraud"].astype("int64")
+    return out
 
-def align_to_expected(df_feat: pd.DataFrame, expected_cols: List[str]) -> pd.DataFrame:
-    aligned = df_feat.reindex(columns=expected_cols, fill_value=0.0)
-    for c in aligned.columns:
-        if aligned[c].dtype == "O":
-            aligned[c] = pd.to_numeric(aligned[c], errors="coerce").fillna(0.0)
-    return aligned
+def upload_df_to_bq(df: pd.DataFrame, table: str) -> str:
+    if df is None or df.empty: return "Skipped (empty)"
+    client = bigquery.Client(project=BQ_PROJECT)
+    job = client.load_table_from_dataframe(df, table,
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"))
+    job.result()
+    return f"Appended {len(df)} rows to {table}"
 
+# UI
+st.title("💳 Credit Card Fraud – Scoring & Export")
+thr = st.sidebar.slider("Decision threshold", 0.0, 1.0, 0.5, 0.001)
 
-# ------------- Scoring -------------
-def score_dataframe(
-    df_raw: pd.DataFrame,
-    pipeline,
-    expected_cols: List[str],
-    threshold: float
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    df_feat = basic_feature_engineering(df_raw)
-    model_df = align_to_expected(df_feat, expected_cols)
+uploaded = st.file_uploader("Upload a CSV of raw transactions", type=["csv"])
+if not uploaded: st.stop()
 
-    try:
-        proba = pipeline.predict_proba(model_df)[:, 1]
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-    preds = (proba >= threshold).astype(int)
+raw = pd.read_csv(uploaded)
+st.write(f"Rows uploaded: **{len(raw):,}**")
 
-    out = df_raw.copy()
-    out["fraud_probability"] = proba
-    out["fraud_prediction"] = preds
-    return out, model_df
+pipe, expected = load_pipe()
 
+# Build features then align to model's expected columns
+feat = build_features(raw)
 
-# ------------- UI -------------
-st.title("💳 Credit Card Fraud Detection")
-
-with st.sidebar:
-    st.header("Model")
-    pipeline = load_pipeline()
-    threshold = load_threshold()
-    st.markdown(f"**Decision threshold:** `{threshold:.3f}`")
-    exp_cols = load_expected_feature_list(pipeline)
-    st.caption(f"Model expects **{len(exp_cols)}** features.")
-
-st.subheader("📤 Upload CSV")
-uploaded = st.file_uploader(
-    "Upload raw transactions (no need to pre-engineer). CSV only.",
-    type=["csv"],
-    help="The app will auto-engineer time/geo/velocity features, align to the trained model, and score.",
-)
-
-# Sample template download
-template_cols = ["transaction_id", "trans_date_trans_time", "cc_num", "amount", "lat", "long", "merch_lat", "merch_long"]
-buf = io.StringIO()
-pd.DataFrame(columns=template_cols).to_csv(buf, index=False)
-st.download_button("📄 Download a sample template", buf.getvalue(), "sample_template.csv", use_container_width=False)
-
-if uploaded is None:
-    st.info("Upload a CSV to start scoring. Keep at least a timestamp, amount, and some IDs for better features.")
-    st.stop()
-
-# Read uploaded
-try:
-    df_in = pd.read_csv(uploaded)
-except UnicodeDecodeError:
-    uploaded.seek(0)
-    df_in = pd.read_csv(uploaded, encoding="latin1")
+# If the model expects a specific column set, align/fill zeros
+if expected is not None:
+    X = feat.reindex(columns=expected, fill_value=0.0)
+else:
+    X = feat
 
 # Score
-with st.spinner("Scoring…"):
-    scored, X_model = score_dataframe(df_in, pipeline, exp_cols, threshold)
+proba = pipe.predict_proba(X)[:,1]
+preds = (proba >= thr).astype(int)
+
+id_col = first(raw, ID_CANDS) or "transaction_id"
+cc_col = first(raw, CC_CANDS) or "cc_num"
+amt_col= first(raw, AMT_CANDS) or "amount"
+
+scored = pd.DataFrame({
+    "transaction_id": raw[id_col].astype(str) if id_col in raw.columns else np.arange(len(raw)).astype(str),
+    "customer_id": raw.get(cc_col, ""),
+    "amount": pd.to_numeric(raw.get(amt_col, 0.0), errors="coerce").fillna(0.0),
+    "fraud_probability": proba.astype(float),
+    "fraud_prediction": preds.astype(int),
+    "is_fraud": pd.to_numeric(raw.get("is_fraud", 0), errors="coerce").fillna(0).astype(int),
+    "score_time": pd.Timestamp.utcnow().tz_convert("UTC"),
+})
 
 # KPIs
-total_rows = len(scored)
-fraud_count = int(scored["fraud_prediction"].sum())
-mean_prob = float(scored["fraud_probability"].mean())
+c1,c2,c3 = st.columns(3)
+c1.metric("Rows Scored", f"{len(scored):,}")
+c2.metric("Predicted Fraud", f"{int(scored['fraud_prediction'].sum()):,}")
+c3.metric("Mean Prob", f"{scored['fraud_probability'].mean():.3f}")
 
-k1, k2, k3 = st.columns(3)
-k1.metric("Rows Scored", f"{total_rows:,}")
-k2.metric("Predicted Fraud (count)", f"{fraud_count:,}")
-k3.metric("Mean Fraud Probability", f"{mean_prob:.3f}")
+# Table & chart
+st.subheader("🔎 Top Suspicious")
+st.dataframe(scored.sort_values("fraud_probability", ascending=False).head(50).reset_index(drop=True))
+st.subheader("Risk Distribution")
+st.plotly_chart(px.histogram(scored, x="fraud_probability", nbins=40), use_container_width=True)
 
-# ----------------- Top suspicious table (safe: no duplicate column names) -----------------
-st.subheader("🔎 Top Suspicious Transactions")
-topn = scored.nlargest(200, "fraud_probability").copy()
+# Metrics + Export
+metrics_daily = build_metrics_daily(scored)
 
-id_actual   = _first_present(scored, RAW_ID_COLS) or "trans_num"
-amt_actual  = _first_present(scored, RAW_AMOUNT_COLS) or "amt"
-cc_actual   = _first_present(scored, RAW_CC_COLS) or "cc_num"
-hour_actual = "hour" if "hour" in scored.columns else None
-label_actual = "is_fraud" if "is_fraud" in scored.columns else None
-
-pairs = [
-    ("transaction_id", id_actual),
-    ("amount", amt_actual),
-    ("hour", hour_actual),
-    ("customer_id", cc_actual),
-    ("is_fraud", label_actual),
-    ("fraud_probability", "fraud_probability"),
-    ("fraud_prediction", "fraud_prediction"),
-]
-pairs = [(lbl, col) for (lbl, col) in pairs if col is not None]
-
-seen_actual = set()
-safe_pairs = []
-for lbl, col in pairs:
-    if col not in seen_actual:
-        safe_pairs.append((lbl, col))
-        seen_actual.add(col)
-
-disp = topn[[col for _, col in safe_pairs]].copy()
-rename_map = {col: lbl for (lbl, col) in safe_pairs}
-disp = disp.rename(columns=rename_map)
-
-st.dataframe(disp, use_container_width=True, height=420)
-# ------------------------------------------------------------------------------------------
-
-# Download scored results
-csv_io = io.StringIO()
-scored.to_csv(csv_io, index=False)
-st.download_button(
-    "💾 Download Scored CSV",
-    csv_io.getvalue(),
-    file_name="scored_transactions.csv",
-    use_container_width=False,
-)
-
-# Visuals
-st.subheader("📊 Visual Insights")
-
+st.subheader("📦 Export")
+tx_csv = scored.to_csv(index=False).encode("utf-8")
+met_csv = metrics_daily.to_csv(index=False).encode("utf-8")
 c1, c2 = st.columns(2)
-with c1:
-    fig = px.histogram(scored, x="fraud_probability", nbins=40, title="Fraud Probability Distribution")
-    fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), bargap=0.05)
-    st.plotly_chart(fig, use_container_width=True)
+c1.download_button("Download transactions_scored.csv", data=tx_csv, file_name="transactions_scored.csv", mime="text/csv")
+c1.download_button("Download metrics_daily.csv", data=met_csv, file_name="metrics_daily.csv", mime="text/csv")
+scored.to_csv(PBI_OUT_DIR / "transactions_scored.csv", index=False)
+metrics_daily.to_csv(PBI_OUT_DIR / "metrics_daily.csv", index=False)
+c1.success(f"Saved CSVs to {PBI_OUT_DIR.as_posix()}")
 
 with c2:
-    # ---- SAFE scatter: color derived from the *same* sampled frame ----
-    amt_col = _first_present(scored, RAW_AMOUNT_COLS) or "amt"
-    sample = scored.sample(min(len(scored), 5000), random_state=42).copy()
-    sample["pred_label"] = sample["fraud_prediction"].map({0: "Legit", 1: "Fraud"}).astype("category")
-
-    fig2 = px.scatter(
-        sample,
-        x=amt_col,
-        y="fraud_probability",
-        color="pred_label",
-        opacity=0.6,
-        title="Amount vs Probability",
-        category_orders={"pred_label": ["Legit", "Fraud"]},
-        labels={"pred_label": "Prediction"},
-    )
-    fig2.update_layout(margin=dict(l=10, r=10, t=40, b=10), legend_title_text="Prediction")
-    st.plotly_chart(fig2, use_container_width=True)
-
-# Explain simple drivers (non-SHAP, safe & fast)
-if "amt" in scored.columns and "fraud_probability" in scored.columns:
-    st.subheader("⚙️ Simple Drivers (univariate)")
-    amt_q = pd.qcut(scored["amt"], q=10, duplicates="drop")
-    by_bucket = scored.groupby(amt_q)["fraud_probability"].mean().reset_index()
-    fig3 = px.bar(by_bucket, x="amt", y="fraud_probability", title="Avg Fraud Prob by Amount Decile")
-    fig3.update_layout(margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig3, use_container_width=True)
-
-st.caption("Tip: If predictions look off on *raw* data, include timestamp and per-card history so auto-engineering can build better velocity features.")
+    if st.button("Export to BigQuery (append)"):
+        try:
+            m1 = upload_df_to_bq(scored[["transaction_id","customer_id","amount","fraud_probability","fraud_prediction","is_fraud","score_time"]], BQ_TABLE_TX)
+            m2 = upload_df_to_bq(metrics_daily[["date","transactions","flagged","avg_risk","total_amount","actual_fraud"]], BQ_TABLE_MET)
+            st.success(f"✅ BigQuery upload complete:\n- {m1}\n- {m2}")
+        except Exception as e:
+            st.error(f"BigQuery upload failed: {e}")

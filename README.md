@@ -1,22 +1,22 @@
-Live demo: https://card-fraud-detection-pipeline-ewap9jamdwal7twcdgad7i.streamlit.app/
-# 💳 Credit Card Fraud Detection Pipeline
+# Credit Card Fraud – Streamlit + BigQuery Export (Drop-in)
 
-End-to-end machine learning pipeline + Streamlit app to detect fraudulent credit card transactions.
-
-## Features
-- Feature engineering (EDA, velocity, time-based features)
-- Trained LightGBM model with calibrated probabilities
-- Batch scoring (`predict_fraud_batch.py`)
-- Streamlit app for manual & CSV scoring
-- Configurable fraud threshold (`inference_threshold.json`)
-
-## Quickstart
+## Setup
 ```bash
-git clone https://github.com/Beepeen78/card-fraud-detection-pipeline.git
-cd card-fraud-detection-pipeline
 pip install -r requirements.txt
-streamlit run app.py
+# Windows: ensure ADC is set up
+# gcloud auth application-default login
+set GOOGLE_APPLICATION_CREDENTIALS=%APPDATA%\gcloud\application_default_credentials.json
+```
 
-## 🚀 Live Demo
-[Click here to try the app]
-https://card-fraud-detection-pipeline-ewap9jamdwal7twcdgad7i.streamlit.app/
+## Run
+```bash
+streamlit run app.py
+```
+
+- Upload a raw CSV (id, time, amount, coords…).
+- Click **Export** to save CSVs under `powerbi/out/`.
+- Click **Export to BigQuery (append)** to push to:
+  - `fraud_prod.transactions_scored`
+  - `fraud_prod.metrics_daily`
+
+> If your model requires engineered features and your joblib doesn’t include preprocessing, this app will align missing columns to zeros as a **fallback**. For best results, retrain and save a Pipeline with preprocessing (preferred).
