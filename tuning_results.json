@@ -1,4 +1,4 @@
 {
-  "heuristic_alpha": 0.46,
-  "threshold": 0.37
+  "heuristic_alpha": 0.45,
+  "threshold": 0.4
 }

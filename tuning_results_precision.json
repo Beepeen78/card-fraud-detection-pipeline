@@ -1,0 +1,26 @@
+{
+  "5fold_summary": {
+    "mean_precision": 0.40605209283470145,
+    "std_precision": 0.057359225803035735,
+    "mean_recall": 0.325,
+    "std_recall": 0.07551903733496608,
+    "mean_f1": 0.3588327220269144,
+    "std_f1": 0.06614359653886592,
+    "mean_roc": 0.8592394111570247,
+    "std_roc": 0.03531123996313682,
+    "mean_pr": 0.29049290361987506,
+    "std_pr": 0.026515280824478956
+  },
+  "best_unconstrained": {
+    "precision": 0.8,
+    "recall": 0.025,
+    "alpha": 0.75,
+    "threshold": 0.8
+  },
+  "best_constrained": {
+    "precision": 0.5573770491803278,
+    "recall": 0.2125,
+    "alpha": 0.45,
+    "threshold": 0.4
+  }
+}
