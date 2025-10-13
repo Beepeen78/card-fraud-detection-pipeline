@@ -1,0 +1,21 @@
+# Snowflake Configuration Template
+# Copy these commands and replace with your actual credentials
+
+# Required Snowflake Settings
+set SNOWFLAKE_ACCOUNT=your_account_identifier
+set SNOWFLAKE_USER=your_username
+set SNOWFLAKE_PASSWORD=your_password
+
+# Optional Snowflake Settings (defaults provided)
+set SNOWFLAKE_WAREHOUSE=COMPUTE_WH
+set SNOWFLAKE_DATABASE=FRAUD_DETECTION
+set SNOWFLAKE_SCHEMA=PRODUCTION
+set SNOWFLAKE_ROLE=PUBLIC
+
+# Example with real values:
+# set SNOWFLAKE_ACCOUNT=abc12345.us-east-1
+# set SNOWFLAKE_USER=john_doe
+# set SNOWFLAKE_PASSWORD=my_secure_password
+
+# After setting these, test with:
+# python setup_snowflake.py test
