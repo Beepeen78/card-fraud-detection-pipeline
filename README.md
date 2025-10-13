@@ -1,5 +1,7 @@
 # Credit Card Fraud – Streamlit + BigQuery + Snowflake Export
 
+[![CI](https://github.com/Beepeen78/card-fraud-detection-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/Beepeen78/card-fraud-detection-pipeline/actions/workflows/ci.yml)
+
 ## Setup
 
 ### 1. Install Dependencies
@@ -64,3 +66,17 @@ The setup creates useful views for analysis:
 
 ## Notes
 > If your model requires engineered features and your joblib doesn't include preprocessing, this app will align missing columns to zeros as a **fallback**. For best results, retrain and save a Pipeline with preprocessing (preferred).
+
+## Quick CLI usage
+
+Score a CSV with the pipeline (CLI mode):
+
+```powershell
+python app.py --csv dummy_transactions.csv --out-dir powerbi/out --threshold 0.37 --heuristic-alpha 0.46
+```
+
+Generate evaluation artifacts (PR/ROC, metrics):
+
+```powershell
+python run_eval.py
+```
