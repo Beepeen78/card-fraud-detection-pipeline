@@ -1,231 +1,299 @@
-
-# app.py — Patched: builds minimal engineered features so raw CSVs work
+﻿# app.py
 from __future__ import annotations
+
 import os
-from pathlib import Path
-from datetime import datetime
-import numpy as np
+from datetime import datetime, timezone
+
 import pandas as pd
-import streamlit as st
 import plotly.express as px
-import joblib
-from google.cloud import bigquery
+import streamlit as st
 
-st.set_page_config(page_title="Credit Card Fraud – Scoring", layout="wide")
+from evaluate_model import evaluate
+from predict_fraud_batch import score_batch
+from powerbi_export import export_powerbi_csvs, POWERBI_OUT
 
-MODEL_PATH = Path("fraud_pipeline.joblib")
-PBI_OUT_DIR = Path("powerbi/out"); PBI_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-BQ_PROJECT   = os.getenv("BQ_PROJECT", "credit-card-fraud-pipeline")
-BQ_DATASET   = os.getenv("BQ_DATASET", "fraud_prod")
-BQ_TABLE_TX  = f"{BQ_PROJECT}.{BQ_DATASET}.transactions_scored"
-BQ_TABLE_MET = f"{BQ_PROJECT}.{BQ_DATASET}.metrics_daily"
+# -------------------------
+# Streamlit page settings
+# -------------------------
+st.set_page_config(page_title="Credit Card Fraud Detection", layout="wide")
+st.title("Credit Card Fraud Detection")
 
-ID_CANDS   = ["transaction_id","trans_num","id"]
-CC_CANDS   = ["cc_num","customer_id","cust_id","user_id"]
-AMT_CANDS  = ["amount","amt","transaction_amount"]
-TS_CANDS   = ["trans_date_trans_time","timestamp","datetime","transaction_time"]
-LABELS     = ["is_fraud","label","target","Class"]
 
-@st.cache_resource(show_spinner=False)
-def load_pipe():
-    pipe = joblib.load(MODEL_PATH)
-    exp = None
+# -------------------------
+# Helpers
+# -------------------------
+def _safe_get_bq_project() -> str | None:
     try:
-        if hasattr(pipe,"named_steps") and "prep" in pipe.named_steps:
-            exp = list(pipe.named_steps["prep"].get_feature_names_out())
-    except Exception:
-        pass
-    if exp is None and hasattr(pipe,"feature_names_in_"):
-        exp = list(pipe.feature_names_in_)
-    return pipe, exp
+        return st.secrets.get("bq_project", os.getenv("BQ_PROJECT", "")) or None
+    except FileNotFoundError:
+        return os.getenv("BQ_PROJECT") or None
 
-def first(df, cols):
-    for c in cols:
-        if c in df.columns: return c
-    return None
 
-def haversine_km(lat1, lon1, lat2, lon2):
-    # vectorized haversine
-    R = 6371.0
-    lat1 = np.radians(lat1); lon1 = np.radians(lon1)
-    lat2 = np.radians(lat2); lon2 = np.radians(lon2)
-    dlat = lat2 - lat1; dlon = lon2 - lon1
-    a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
-    return 2*R*np.arcsin(np.sqrt(a))
+def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
 
-def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """Create a broad set of engineered features w/ safe defaults.
-       Rolling/TE features that require history are set to 0.
-    """
-    df = df_raw.copy()
+    for c in ["transaction_id", "customer_id"]:
+        if c in out.columns:
+            out[c] = out[c].astype(str)
 
-    # Core column names
-    id_col  = first(df, ID_CANDS)  or "transaction_id"
-    cc_col  = first(df, CC_CANDS)  or "cc_num"
-    amt_col = first(df, AMT_CANDS) or "amount"
-    ts_col  = first(df, TS_CANDS)  or "trans_date_trans_time"
+    if "unix_time" in out.columns:
+        out["unix_time"] = pd.to_numeric(out["unix_time"], errors="coerce").fillna(0).astype("int64")
 
-    if id_col not in df.columns:
-        df[id_col] = np.arange(len(df)).astype(str)
+    # Support 'amt' alias
+    if "amount" not in out.columns and "amt" in out.columns:
+        out["amount"] = out["amt"]
+    if "amount" in out.columns:
+        out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0.0)
 
-    # Coerce
-    df[amt_col] = pd.to_numeric(df.get(amt_col, 0.0), errors="coerce").fillna(0.0)
-    ts = pd.to_datetime(df.get(ts_col, datetime.utcnow()), errors="coerce", utc=True)
-    df["unix_time"] = (ts.view("int64") // 10**9).astype("int64")
-    df["hour"]      = ts.dt.hour.fillna(0).astype(int)
-    df["dayofweek"] = ts.dt.dayofweek.fillna(0).astype(int)
-    df["dayofyear"] = ts.dt.dayofyear.fillna(1).astype(int)
+    if "is_fraud" in out.columns:
+        out["is_fraud"] = pd.to_numeric(out["is_fraud"], errors="coerce").fillna(0).astype("int64")
 
-    # Geo
-    lat = pd.to_numeric(df.get("lat", 0), errors="coerce").fillna(0.0)
-    lon = pd.to_numeric(df.get("long", 0), errors="coerce").fillna(0.0)
-    mlat= pd.to_numeric(df.get("merch_lat", 0), errors="coerce").fillna(0.0)
-    mlon= pd.to_numeric(df.get("merch_long", 0), errors="coerce").fillna(0.0)
-
-    df["mean_distance"]   = haversine_km(lat, lon, mlat, mlon)
-    df["dist_home_merch"] = df["mean_distance"]  # proxy if no home coords
-
-    # Sine/cosine time encodings
-    df["hour_sin"] = np.sin(2*np.pi*df["hour"]/24)
-    df["hour_cos"] = np.cos(2*np.pi*df["hour"]/24)
-    df["dow_sin"]  = np.sin(2*np.pi*df["dayofweek"]/7)
-    df["dow_cos"]  = np.cos(2*np.pi*df["dayofweek"]/7)
-
-    # Flags
-    df["is_weekend"] = df["dayofweek"].isin([5,6]).astype(int)
-    df["is_night"]   = ((df["hour"] < 6) | (df["hour"] >= 22)).astype(int)
-    df["is_business_hours"] = df["hour"].between(9,17).astype(int)
-
-    # Basic amt stats per row (fallbacks; real training used windows)
-    df["max_amt"]    = df[amt_col]
-    df["median_amt"] = df[amt_col]
-    df["std_amt"]    = 0.0
-    df["mean_amt"]   = df[amt_col]
-
-    # Window features (no history in single file) -> zeros
-    for c in [
-        "txn_count_last_1h","txn_count_last_24h","txn_count_last_1h_category",
-        "txn_count_last_24h_category","total_amt_last_1h","total_amt_last_24h",
-        "total_amt_last_1h_category","total_amt_last_24h_category",
-        "time_since_last_txn","transaction_count"
-    ]:
-        df[c] = 0.0
-
-    # Simple categorical encodings (fallbacks)
-    if "gender" in df.columns:
-        df["gender_bin"] = df["gender"].astype(str).str.lower().map({"m":1,"male":1,"f":0,"female":0}).fillna(0).astype(int)
-    else:
-        df["gender_bin"] = 0
-
-    # Distance category / job target-encoding placeholders
-    df["te_dist_category"] = 0.0
-    df["te_job"] = 0.0
-
-    # Direct passthroughs if present
-    for passthru in ["city_pop","merch_zipcode","month"]:
-        if passthru not in df.columns: df[passthru] = 0
-
-    # Ensure original needed columns are present
-    if "amt" not in df.columns: df["amt"] = df[amt_col]
-
-    return df
-
-def build_metrics_daily(scored: pd.DataFrame) -> pd.DataFrame:
-    scored = scored.copy()
-    scored["date"] = pd.to_datetime(scored["score_time"], utc=True).dt.date
-    out = (
-        scored.groupby("date", as_index=False)
-        .agg(
-            transactions=("transaction_id","count"),
-            flagged=("fraud_prediction","sum"),
-            avg_risk=("fraud_probability","mean"),
-            total_amount=("amount","sum"),
-            actual_fraud=("is_fraud","sum")
-        )
-    )
-    out["transactions"]=out["transactions"].astype("int64")
-    out["flagged"]=out["flagged"].astype("int64")
-    out["actual_fraud"]=out["actual_fraud"].astype("int64")
     return out
 
-def upload_df_to_bq(df: pd.DataFrame, table: str) -> str:
-    if df is None or df.empty: return "Skipped (empty)"
-    client = bigquery.Client(project=BQ_PROJECT)
-    job = client.load_table_from_dataframe(df, table,
-        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"))
-    job.result()
-    return f"Appended {len(df)} rows to {table}"
 
-# UI
-st.title("💳 Credit Card Fraud – Scoring & Export")
-thr = st.sidebar.slider("Decision threshold", 0.0, 1.0, 0.5, 0.001)
+def _export_to_bigquery(scored: pd.DataFrame, project: str) -> None:
+    from google.cloud import bigquery
+    from google.api_core.exceptions import NotFound, BadRequest
 
-uploaded = st.file_uploader("Upload a CSV of raw transactions", type=["csv"])
-if not uploaded: st.stop()
+    client = bigquery.Client(project=project)
+    dataset_id = f"{project}.fraud_prod"
+    table_id = f"{dataset_id}.transactions_scored"
 
-raw = pd.read_csv(uploaded)
-st.write(f"Rows uploaded: **{len(raw):,}**")
+    try:
+        client.get_dataset(dataset_id)
+    except NotFound:
+        client.create_dataset(bigquery.Dataset(dataset_id))
 
-pipe, expected = load_pipe()
+    base_fields = [
+        bigquery.SchemaField("transaction_id", "STRING"),
+        bigquery.SchemaField("amount", "NUMERIC"),
+        bigquery.SchemaField("fraud_probability", "FLOAT64"),
+        bigquery.SchemaField("fraud_prediction", "INT64"),
+        bigquery.SchemaField("is_fraud", "INT64"),
+        bigquery.SchemaField("score_time", "TIMESTAMP"),
+    ]
 
-# Build features then align to model's expected columns
-feat = build_features(raw)
+    try:
+        table = client.get_table(table_id)
+        table_exists = True
+    except NotFound:
+        table_exists = False
 
-# If the model expects a specific column set, align/fill zeros
-if expected is not None:
-    X = feat.reindex(columns=expected, fill_value=0.0)
-else:
-    X = feat
+    df_has_customer = "customer_id" in scored.columns
+    schema = ([bigquery.SchemaField("customer_id", "STRING")] + base_fields) if df_has_customer else base_fields
 
-# Score
-proba = pipe.predict_proba(X)[:,1]
-preds = (proba >= thr).astype(int)
+    if not table_exists:
+        client.create_table(bigquery.Table(table_id, schema=schema))
 
-id_col = first(raw, ID_CANDS) or "transaction_id"
-cc_col = first(raw, CC_CANDS) or "cc_num"
-amt_col= first(raw, AMT_CANDS) or "amount"
+    df_out = scored.copy()
+    if "transaction_id" not in df_out.columns:
+        df_out["transaction_id"] = ""
 
-scored = pd.DataFrame({
-    "transaction_id": raw[id_col].astype(str) if id_col in raw.columns else np.arange(len(raw)).astype(str),
-    "customer_id": raw.get(cc_col, ""),
-    "amount": pd.to_numeric(raw.get(amt_col, 0.0), errors="coerce").fillna(0.0),
-    "fraud_probability": proba.astype(float),
-    "fraud_prediction": preds.astype(int),
-    "is_fraud": pd.to_numeric(raw.get("is_fraud", 0), errors="coerce").fillna(0).astype(int),
-    "score_time": pd.Timestamp.utcnow().tz_convert("UTC"),
-})
+    if df_has_customer:
+        df_out["customer_id"] = df_out["customer_id"].astype(str)
 
-# KPIs
-c1,c2,c3 = st.columns(3)
-c1.metric("Rows Scored", f"{len(scored):,}")
-c2.metric("Predicted Fraud", f"{int(scored['fraud_prediction'].sum()):,}")
-c3.metric("Mean Prob", f"{scored['fraud_probability'].mean():.3f}")
+    if "amount" in df_out.columns:
+        df_out["amount"] = pd.to_numeric(df_out["amount"], errors="coerce").round(2)
 
-# Table & chart
-st.subheader("🔎 Top Suspicious")
-st.dataframe(scored.sort_values("fraud_probability", ascending=False).head(50).reset_index(drop=True))
-st.subheader("Risk Distribution")
-st.plotly_chart(px.histogram(scored, x="fraud_probability", nbins=40), use_container_width=True)
+    for c in ["fraud_prediction", "is_fraud"]:
+        if c in df_out.columns:
+            df_out[c] = pd.to_numeric(df_out[c], errors="coerce").fillna(0).astype("Int64")
 
-# Metrics + Export
-metrics_daily = build_metrics_daily(scored)
+    if "fraud_probability" in df_out.columns:
+        df_out["fraud_probability"] = pd.to_numeric(df_out["fraud_probability"], errors="coerce")
 
-st.subheader("📦 Export")
-tx_csv = scored.to_csv(index=False).encode("utf-8")
-met_csv = metrics_daily.to_csv(index=False).encode("utf-8")
-c1, c2 = st.columns(2)
-c1.download_button("Download transactions_scored.csv", data=tx_csv, file_name="transactions_scored.csv", mime="text/csv")
-c1.download_button("Download metrics_daily.csv", data=met_csv, file_name="metrics_daily.csv", mime="text/csv")
-scored.to_csv(PBI_OUT_DIR / "transactions_scored.csv", index=False)
-metrics_daily.to_csv(PBI_OUT_DIR / "metrics_daily.csv", index=False)
-c1.success(f"Saved CSVs to {PBI_OUT_DIR.as_posix()}")
+    if "score_time" in df_out.columns:
+        df_out["score_time"] = pd.to_datetime(df_out["score_time"], utc=True)
 
-with c2:
-    if st.button("Export to BigQuery (append)"):
+    ordered_cols = [f.name for f in schema if f.name in df_out.columns]
+    df_out = df_out[ordered_cols]
+
+    job_config = bigquery.LoadJobConfig(
+        schema=schema,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+        source_format=bigquery.SourceFormat.PARQUET,
+    )
+
+    job = client.load_table_from_dataframe(df_out, table_id, job_config=job_config)
+    job.result()  # raises on error
+
+
+# -------------------------
+# Sidebar Controls
+# -------------------------
+st.sidebar.header("Settings")
+threshold = st.sidebar.slider(
+    "Decision threshold", min_value=0.01, max_value=0.95, value=0.50, step=0.01,
+    help="Transactions with fraud_probability ≥ threshold are flagged as fraud."
+)
+
+if st.sidebar.button("Download sample template"):
+    template_cols = [
+        "transaction_id", "customer_id", "amount",
+        "lat", "long", "city_pop", "unix_time",
+        "merch_lat", "merch_long", "merch_zipcode", "is_fraud"
+    ]
+    sample_csv = pd.DataFrame(columns=template_cols).to_csv(index=False)
+    st.sidebar.download_button(
+        label="Download CSV template",
+        data=sample_csv,
+        file_name="sample_credit_card_transactions.csv",
+        mime="text/csv",
+    )
+
+
+# -------------------------
+# Main Upload & Scoring
+# -------------------------
+uploaded = st.file_uploader(
+    "Upload a CSV of raw transactions (max ~200MB)",
+    type=["csv"],
+    help="Minimum: transaction_id + amount (or amt). More features = better accuracy."
+)
+
+BQ_PROJECT = _safe_get_bq_project()
+if not BQ_PROJECT:
+    st.info(
+        "BigQuery export is optional → set `bq_project` in `.streamlit/secrets.toml` "
+        "or the `BQ_PROJECT` env var to enable it."
+    )
+
+if uploaded is not None:
+    try:
+        raw_df = pd.read_csv(uploaded)
+    except Exception as e:
+        st.error("Failed to read CSV. Make sure it's a valid file.")
+        st.exception(e)
+        st.stop()
+
+    if raw_df.empty:
+        st.error("Uploaded CSV is empty.")
+        st.stop()
+
+    raw_df = _coerce_types(raw_df)
+    
+    # === ADD THESE LINES HERE (right after _coerce_types) ===
+    # Auto-map columns from the official kartik2112 fraudTest.csv / fraudTrain.csv
+    if "trans_num" in raw_df.columns:
+        raw_df["transaction_id"] = raw_df["trans_num"].astype(str)
+    elif "transaction_id" not in raw_df.columns:
+        raw_df["transaction_id"] = raw_df.index.astype(str)
+
+    if "cc_num" in raw_df.columns and "customer_id" not in raw_df.columns:
+        raw_df["customer_id"] = raw_df["cc_num"].astype(str)
+
+    if "amt" in raw_df.columns and "amount" not in raw_df.columns:
+        raw_df["amount"] = raw_df["amt"]
+    # ====================================================
+
+    # === Column validation continues below (no changes needed) ===
+    required_cols = ["transaction_id"]
+    # ...
+
+    # === Column validation ===
+    required_cols = ["transaction_id"]
+    if "amount" not in raw_df.columns and "amt" not in raw_df.columns:
+        required_cols.append("amount (or amt)")
+
+    missing_required = [c for c in required_cols if c not in raw_df.columns and c != "amount (or amt)"]
+    if missing_required:
+        st.error(f"Missing required column(s): {', '.join(missing_required)}")
+        st.stop()
+
+    expected_features = ["lat", "long", "city_pop", "unix_time", "merch_lat", "merch_long"]
+    missing_features = [c for c in expected_features if c not in raw_df.columns]
+    if missing_features:
+        st.warning(
+            f"Missing {len(missing_features)} recommended feature(s) → accuracy may be lower:\n"
+            f"`{', '.join(missing_features[:6])}{'...' if len(missing_features)>6 else ''}`"
+        )
+
+    # === Scoring ===
+    with st.spinner(f"Scoring {len(raw_df):,} transactions..."):
         try:
-            m1 = upload_df_to_bq(scored[["transaction_id","customer_id","amount","fraud_probability","fraud_prediction","is_fraud","score_time"]], BQ_TABLE_TX)
-            m2 = upload_df_to_bq(metrics_daily[["date","transactions","flagged","avg_risk","total_amount","actual_fraud"]], BQ_TABLE_MET)
-            st.success(f"✅ BigQuery upload complete:\n- {m1}\n- {m2}")
+            scored = score_batch(raw_df, threshold=threshold)
         except Exception as e:
-            st.error(f"BigQuery upload failed: {e}")
+            st.error("Scoring failed — check your model (`predict_fraud_batch.py`) and column names.")
+            st.exception(e)
+            st.stop()
+
+    # Timestamp all rows with current UTC time
+    scored["score_time"] = pd.Timestamp.now(tz="UTC")
+
+    # === Results ===
+    st.success(f"Scored {len(scored):,} transactions in batch")
+
+    st.subheader("Top Suspicious Transactions")
+    display_cols = [c for c in [
+        "transaction_id", "customer_id", "amount",
+        "fraud_probability", "fraud_prediction", "is_fraud", "score_time"
+    ] if c in scored.columns]
+
+    top_n = scored.sort_values("fraud_probability", ascending=False)[display_cols].head(200)
+    st.dataframe(top_n, use_container_width=True)
+
+    # Score distribution
+    if len(scored) > 1 and "fraud_probability" in scored.columns:
+        fig = px.histogram(
+            scored,
+            x="fraud_probability",
+            nbins=50,
+            color="fraud_prediction",
+            title="Fraud Probability Distribution",
+            marginal="box",
+            hover_data=["amount"]
+        )
+        fig.update_layout(bargap=0.1)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Evaluation metrics if ground truth exists
+    metrics = evaluate(scored)
+    if metrics:
+        st.subheader("Model Performance (on uploaded labels)")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("AUC-ROC", f"{metrics.get('auc', 0):.3f}")
+        col2.metric("Precision", f"{metrics.get('precision', 0):.3f}")
+        col3.metric("Recall", f"{metrics.get('recall', 0):.3f}")
+        col4.metric("F1 Score", f"{metrics.get('f1', 0):.3f}")
+        with st.expander("Full metrics JSON"):
+            st.json(metrics)
+
+    # === Exports ===
+    st.subheader("Export Results")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("Export CSVs for Power BI"):
+            try:
+                p1, p2 = export_powerbi_csvs(scored)
+                st.success(f"Saved to `{POWERBI_OUT}`")
+                st.code(f"{p1}\n{p2}")
+            except Exception as e:
+                st.error(f"Power BI export failed: {e}")
+
+    with c2:
+        if BQ_PROJECT:
+            if st.button("Export to BigQuery (append)"):
+                with st.spinner("Uploading to BigQuery..."):
+                    try:
+                        _export_to_bigquery(scored, BQ_PROJECT)
+                        st.success(f"Appended {len(scored)} rows to BigQuery!")
+                    except Exception as e:
+                        st.error(f"BigQuery export failed: {e}")
+        else:
+            st.caption("BigQuery export disabled (no project configured)")
+
+else:
+    st.info(
+        """
+        ### How to use
+        1. Upload a CSV with at least `transaction_id` and `amount` (or `amt`)  
+        2. Add geographic/time features for best accuracy  
+        3. Adjust threshold → explore results → export
+
+        **Minimum columns**: `transaction_id`, `amount`  
+        **Recommended**: `lat`, `long`, `city_pop`, `unix_time`, `merch_lat`, `merch_long`
+        """
+    )
