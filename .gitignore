@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -27,9 +27,31 @@ dataset/
 *.db
 *.zip
 
-# Large artifacts you don’t want on Git
+# Large artifacts you don't want on Git
 *.log
 eval_out/
 monitoring/
 *.bak
 *backup_*.py
+
+# Model files (too large for git, should be generated)
+*.pkl
+*.joblib
+*.h5
+*.pb
+
+# Generated sample data (can be regenerated)
+sample_transactions.csv
+
+# Power BI output (generated files)
+powerbi/out/*.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model training outputs (can be regenerated)
+fraud_model_improved_*.pkl
+fraud_model_improved_*.json
