@@ -16,6 +16,14 @@ from sklearn.metrics import (
     precision_recall_curve, average_precision_score, f1_score, roc_curve
 )
 
+# Import Power BI export function
+try:
+    from powerbi_export import export_powerbi_csvs
+    POWERBI_AVAILABLE = True
+except ImportError:
+    POWERBI_AVAILABLE = False
+    print("⚠️ powerbi_export module not found. Power BI export will be skipped.")
+
 MODEL_PATH = "fraud_lgbm_calibrated.pkl"
 
 print("Loading model...")
@@ -1168,6 +1176,14 @@ def predict_fraud_enhanced(file, threshold: float = 0.5):
 **Accuracy:** {(tp + tn) / total * 100:.2f}%
         """
 
+        # Export to Power BI (automatic)
+        if POWERBI_AVAILABLE:
+            try:
+                export_powerbi_csvs(result_df)
+                print("✅ Data exported to Power BI format")
+            except Exception as e:
+                print(f"⚠️ Power BI export failed: {e}")
+        
         # Get top suspicious transactions
         top_df = result_df.nlargest(20, "fraud_probability")
         
@@ -1428,15 +1444,27 @@ with gr.Blocks(
 
 
 if __name__ == "__main__":
+    import os
+    
     print("Starting Gradio app...")
-    print("Server will be available at http://127.0.0.1:7860")
-    print("Watch this console for debug output when you upload files!")
-    demo.queue(api_open=False)
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
-        share=False,
-        show_error=True,
-        quiet=False,
-        inbrowser=False,
-    )
+    
+    # Check if running on Hugging Face Spaces
+    is_spaces = os.getenv("SPACE_ID") is not None
+    
+    if is_spaces:
+        print("Detected Hugging Face Spaces environment")
+        # On Spaces, use default settings (Gradio handles this automatically)
+        demo.queue(api_open=False)
+        demo.launch(show_error=True)
+    else:
+        print("Running locally - server will be available at http://127.0.0.1:7860")
+        print("Watch this console for debug output when you upload files!")
+        demo.queue(api_open=False)
+        demo.launch(
+            server_name="127.0.0.1",
+            server_port=7860,
+            share=False,
+            show_error=True,
+            quiet=False,
+            inbrowser=False,
+        )

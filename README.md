@@ -96,7 +96,20 @@ Here's what each file does:
 **`powerbi_export.py`** - Power BI integration
 - Exports scored transactions to CSV for Power BI
 - Creates daily metrics files
+- Automatically enhances data with calculated fields
 - Outputs to `powerbi/out/` directory
+- **Automatically runs when you process transactions in the app**
+
+**`powerbi/`** - Complete Power BI project
+- `README.md` - Power BI project overview
+- `QUICK_START.md` - 5-minute setup guide
+- `setup_instructions.md` - Detailed setup steps
+- `dashboard_layout.md` - Dashboard design guide
+- `fraud_detection_queries.m` - Power Query (M) scripts
+- `dax_measures.txt` - 30+ DAX measures for analytics
+- `powerbi_theme.json` - Custom theme file
+- `alerts_and_rules.md` - Alert configuration guide
+- `prepare_powerbi_data.py` - Enhanced data preparation script
 
 **`upload_to_bigquery.py`** - BigQuery integration
 - Uploads results to Google BigQuery
