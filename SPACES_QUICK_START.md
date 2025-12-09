@@ -83,6 +83,8 @@ git push
 3. **README**: Must have YAML frontmatter (see `README_SPACE.md`)
 4. **app.py**: Already updated to auto-detect Spaces environment ✅
 
-## 📖 Full Guide
+## 🔧 Troubleshooting
 
-See `SPACES_DEPLOYMENT.md` for detailed instructions and troubleshooting.
+- **Build fails**: Check Space logs, verify `requirements.txt` is correct
+- **Model file missing**: Train model first or add `fraud_lgbm_calibrated.pkl` to Space
+- **Authentication issues**: Run `huggingface-cli login` or add SSH key at https://huggingface.co/settings/keys
