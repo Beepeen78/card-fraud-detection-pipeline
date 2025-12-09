@@ -1558,8 +1558,8 @@ if __name__ == "__main__":
     if is_spaces:
         print("Detected Hugging Face Spaces environment")
         # On Spaces, use default settings (Gradio handles this automatically)
-        demo.queue(api_open=False)
-        demo.launch(show_error=True)
+        # Don't use queue() on Spaces as it can cause issues
+        demo.launch(show_error=True, server_name="0.0.0.0", server_port=7860)
     else:
         print("Running locally - server will be available at http://127.0.0.1:7860")
         print("Watch this console for debug output when you upload files!")
