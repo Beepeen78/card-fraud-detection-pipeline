@@ -55,3 +55,8 @@ powerbi/out/*.csv
 # Model training outputs (can be regenerated)
 fraud_model_improved_*.pkl
 fraud_model_improved_*.json
+
+# Non-essential folders (not needed for deployment)
+Card-Fraud-detection/
+notebooks/
+powerbi/
