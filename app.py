@@ -24,23 +24,94 @@ except ImportError:
     POWERBI_AVAILABLE = False
     print("⚠️ powerbi_export module not found. Power BI export will be skipped.")
 
-MODEL_PATH = "fraud_lgbm_calibrated.pkl"
-
-print("Loading model...")
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
-
-model = joblib.load(MODEL_PATH)
-print(f"✅ Model loaded! Features: {model.n_features_in_}")
-print(f"   Model type: {type(model)}")
-
-# Test model with dummy data to verify it works
+# Fix for Gradio API info generation bug
+# Monkey-patch to handle the TypeError in gradio_client.utils when schema is a bool
 try:
-    test_features = np.zeros((1, model.n_features_in_))
-    test_pred = model.predict_proba(test_features)[:, 1]
-    print(f"   ✅ Model test prediction: {test_pred[0]:.4f}")
+    import gradio_client.utils as client_utils
+    
+    # Patch get_type to handle bool values
+    original_get_type = client_utils.get_type
+    
+    def patched_get_type(schema):
+        """Patched version that handles bool schema values"""
+        # Handle case where schema is a bool (True/False) instead of a dict
+        if isinstance(schema, bool):
+            return "bool"
+        if not isinstance(schema, dict):
+            return "Any"
+        # Check if "const" key exists before using "in" operator
+        if isinstance(schema, dict) and "const" in schema:
+            return str(schema["const"])
+        try:
+            return original_get_type(schema)
+        except TypeError:
+            # Fallback if original function fails
+            return "Any"
+    
+    client_utils.get_type = patched_get_type
+    
+    # Also patch _json_schema_to_python_type to handle additionalProperties being a bool
+    original_json_schema_to_python_type = client_utils._json_schema_to_python_type
+    
+    def patched_json_schema_to_python_type(schema, defs=None):
+        """Patched version that handles bool additionalProperties"""
+        if isinstance(schema, bool):
+            return "Any"
+        if isinstance(schema, dict) and "additionalProperties" in schema:
+            additional_props = schema["additionalProperties"]
+            if isinstance(additional_props, bool):
+                # If additionalProperties is True, allow any properties
+                # If False, no additional properties allowed
+                schema = schema.copy()
+                schema["additionalProperties"] = {"type": "object" if additional_props else "null"}
+        try:
+            return original_json_schema_to_python_type(schema, defs)
+        except (TypeError, KeyError) as e:
+            # Fallback to avoid crashes
+            return "Any"
+    
+    client_utils._json_schema_to_python_type = patched_json_schema_to_python_type
+    print("✅ Gradio API info bug patched")
 except Exception as e:
-    print(f"   ⚠️ Model test failed: {e}")
+    print(f"⚠️ Could not patch Gradio client utils: {e}")
+
+MODEL_PATH = "fraud_lgbm_calibrated.pkl"
+model = None
+
+def load_model():
+    """Load the model file if it exists."""
+    global model
+    if model is not None:
+        return model
+    
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Model file not found: {MODEL_PATH}\n"
+            f"Please train the model first or download it from your repository.\n"
+            f"The model file should be in the same directory as app.py"
+        )
+    
+    print("Loading model...")
+    model = joblib.load(MODEL_PATH)
+    print(f"✅ Model loaded! Features: {model.n_features_in_}")
+    print(f"   Model type: {type(model)}")
+    
+    # Test model with dummy data to verify it works
+    try:
+        test_features = np.zeros((1, model.n_features_in_))
+        test_pred = model.predict_proba(test_features)[:, 1]
+        print(f"   ✅ Model test prediction: {test_pred[0]:.4f}")
+    except Exception as e:
+        print(f"   ⚠️ Model test failed: {e}")
+    
+    return model
+
+# Try to load model at startup (but don't crash if it fails)
+try:
+    load_model()
+except FileNotFoundError as e:
+    print(f"⚠️ {e}")
+    print("⚠️ App will start but predictions will fail until model is available.")
 
 
 def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
@@ -54,14 +125,12 @@ def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
 
     # === EXACT 25 FEATURES THE MODEL WAS TRAINED ON ===
     exact_features = [
-        'amt', 'city_pop', 'dist_home_merch', 'hour', 'dayofweek', 'month', 'dayofyear',
-        'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
-        'txn_count_last_1h', 'total_amt_last_1h',
-        'txn_count_last_24h', 'total_amt_last_24h',
-        'txn_count_last_1h_category', 'total_amt_last_1h_category',
-        'txn_count_last_24h_category', 'total_amt_last_24h_category',
-        'mean_distance', 'time_since_last_txn', 'mean_amt', 'std_amt',
-        'te_job', 'te_dist_category'
+        'amt', 'city_pop', 'dayofweek', 'dayofyear', 'dist_category_bucket_idx',
+        'dist_home_merch', 'dow_cos', 'dow_sin', 'hour', 'hour_cos', 'hour_sin',
+        'is_business_hours', 'is_night', 'is_weekend', 'max_amt', 'mean_amt',
+        'median_amt', 'month', 'std_amt', 'time_since_last_txn',
+        'total_amt_last_1h', 'total_amt_last_24h', 'transaction_count',
+        'txn_count_last_1h', 'txn_count_last_24h'
     ]
 
     # Extract time features from unix_time if present
@@ -87,6 +156,16 @@ def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
             angle = 2 * np.pi * df[col] / period
             df[sin_col] = np.sin(angle)
             df[cos_col] = np.cos(angle)
+    
+    # Time-based flags
+    if "hour" in df.columns:
+        df["is_weekend"] = (df["dayofweek"] >= 5).astype(int)
+        df["is_night"] = ((df["hour"] >= 22) | (df["hour"] <= 5)).astype(int)
+        df["is_business_hours"] = ((df["hour"] >= 9) & (df["hour"] <= 17)).astype(int)
+    else:
+        df["is_weekend"] = 0
+        df["is_night"] = 0
+        df["is_business_hours"] = 0
 
     # Ensure base features exist with sensible defaults
     if "amt" not in df.columns:
@@ -103,6 +182,16 @@ def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
     
     if "dist_home_merch" not in df.columns:
         df["dist_home_merch"] = 5.0  # Default distance (5 km)
+    
+    # Create dist_category_bucket_idx from dist_category if available
+    if "dist_category_bucket_idx" not in df.columns:
+        if "dist_category" in df.columns:
+            # Map distance categories to bucket indices
+            dist_order = {"<1km": 0, "1-10km": 1, "10-50km": 2, "50-100km": 3, "100-500km": 4, "500km+": 5, ">=500km": 5}
+            df["dist_category_bucket_idx"] = df["dist_category"].map(dist_order).fillna(3).astype(int)
+        else:
+            # Default to middle bucket (3 = 50-100km)
+            df["dist_category_bucket_idx"] = 3
 
     # Fill historical/velocity features with sensible defaults (not 0!)
     # These features typically have non-zero values in real data
@@ -111,10 +200,6 @@ def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
         'total_amt_last_1h': df["amt"].fillna(50.0),  # Use current amount as estimate
         'txn_count_last_24h': 3.0,  # Typical: 3 transactions per day
         'total_amt_last_24h': df["amt"].fillna(50.0) * 3,  # Estimate based on count
-        'txn_count_last_1h_category': 1.0,
-        'total_amt_last_1h_category': df["amt"].fillna(50.0),
-        'txn_count_last_24h_category': 2.0,
-        'total_amt_last_24h_category': df["amt"].fillna(50.0) * 2,
     }
     
     for col, default_val in velocity_defaults.items():
@@ -125,11 +210,14 @@ def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
                 df[col] = default_val
 
     # Fill aggregated features with sensible defaults
+    amt_filled = df["amt"].fillna(50.0)
     aggregate_defaults = {
-        'mean_distance': df["dist_home_merch"].fillna(5.0),  # Use current distance
         'time_since_last_txn': 3600.0,  # 1 hour ago (in seconds)
-        'mean_amt': df["amt"].fillna(50.0),  # Use current amount as mean
-        'std_amt': df["amt"].fillna(50.0) * 0.3,  # 30% of mean as std
+        'mean_amt': amt_filled,  # Use current amount as mean
+        'std_amt': amt_filled * 0.3,  # 30% of mean as std
+        'median_amt': amt_filled,  # Use current amount as median
+        'max_amt': amt_filled,  # Use current amount as max
+        'transaction_count': 1.0,  # At least this transaction
     }
     
     for col, default_val in aggregate_defaults.items():
@@ -138,17 +226,6 @@ def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
                 df[col] = default_val
             else:
                 df[col] = default_val
-
-    # Fill target encoding features with default values (average fraud rate)
-    # These are typically between 0 and 1, representing historical fraud rates
-    encoding_defaults = {
-        'te_job': 0.005,  # ~0.5% fraud rate (typical baseline)
-        'te_dist_category': 0.005,
-    }
-    
-    for col, default_val in encoding_defaults.items():
-        if col not in df.columns:
-            df[col] = default_val
 
     # Use ONLY the 25 features, in sorted order (LightGBM is picky about feature order)
     feature_df = df[sorted(exact_features)].copy()
@@ -172,14 +249,24 @@ def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
             print(f"     {col}: [{feature_df[col].min():.2f}, {feature_df[col].max():.2f}]")
     print(f"   - Any NaN values: {feature_df.isna().sum().sum()}")
 
+    # Load model if not already loaded
+    try:
+        current_model = load_model()
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            f"Model file not found: {MODEL_PATH}\n"
+            f"Cannot perform predictions without the model.\n"
+            f"Please ensure fraud_lgbm_calibrated.pkl is in the same directory as app.py"
+        )
+    
     # Predict calibrated probabilities
     try:
-        prob = model.predict_proba(feature_df)[:, 1]
+        prob = current_model.predict_proba(feature_df)[:, 1]
         print(f"   - Probability range: [{prob.min():.4f}, {prob.max():.4f}]")
         print(f"   - Mean probability: {prob.mean():.4f}")
     except Exception as e:
         print(f"❌ Prediction error: {e}")
-        print(f"   Model expects {model.n_features_in_} features, got {feature_df.shape[1]}")
+        print(f"   Model expects {current_model.n_features_in_} features, got {feature_df.shape[1]}")
         print(f"   Feature columns: {list(feature_df.columns)}")
         raise
     
@@ -1058,6 +1145,23 @@ def predict_fraud_enhanced(file, threshold: float = 0.5):
             result_df = score_batch(df, threshold=threshold)
             print(f"Score_batch completed. Result shape: {result_df.shape}")
             print(f"Fraud probabilities range: {result_df['fraud_probability'].min():.4f} to {result_df['fraud_probability'].max():.4f}")
+        except FileNotFoundError as model_error:
+            # Handle missing model file with user-friendly message
+            error_msg = (
+                f"❌ **Model File Not Found**\n\n"
+                f"The fraud detection model (`fraud_lgbm_calibrated.pkl`) is required to make predictions.\n\n"
+                f"**To fix this:**\n"
+                f"1. Download the model file from your GitHub repository\n"
+                f"2. Place it in the same directory as `app.py`\n"
+                f"3. Or train a new model using the notebook: `notebooks/eda_and_feature_engineering.ipynb`\n\n"
+                f"**Error details:** {str(model_error)}"
+            )
+            print(f"MODEL ERROR: {error_msg}")
+            return (
+                error_msg,
+                pd.DataFrame(),
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None
+            )
         except Exception as score_error:
             import traceback
             error_details = f"Error during scoring: {str(score_error)}\n\n{traceback.format_exc()}"
@@ -1065,7 +1169,7 @@ def predict_fraud_enhanced(file, threshold: float = 0.5):
             return (
                 f"❌ {error_details}",
                 pd.DataFrame(),
-                None, None, None, None, None, None, None, None
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None
             )
 
         # Calculate statistics
@@ -1429,8 +1533,8 @@ with gr.Blocks(
             output_table,
             viz1, viz2, viz3, viz4, viz5, viz6, viz7, viz8,
             viz9, viz10, viz11, viz12, viz13, viz14, viz15
-        ],
-        api_name="predict_fraud"
+        ]
+        # Removed api_name to avoid Gradio API info generation bug
     )
     
     gr.Markdown("""
@@ -1460,11 +1564,26 @@ if __name__ == "__main__":
         print("Running locally - server will be available at http://127.0.0.1:7860")
         print("Watch this console for debug output when you upload files!")
         demo.queue(api_open=False)
-        demo.launch(
-            server_name="127.0.0.1",
-            server_port=7860,
-            share=False,
-            show_error=True,
-            quiet=False,
-            inbrowser=False,
-        )
+        try:
+            demo.launch(
+                server_name="0.0.0.0",  # Use 0.0.0.0 instead of 127.0.0.1 for better compatibility
+                server_port=7860,
+                share=False,
+                show_error=True,
+                quiet=False,
+                inbrowser=False,
+            )
+        except ValueError as e:
+            # Fallback if 0.0.0.0 doesn't work, try with share enabled
+            if "localhost is not accessible" in str(e):
+                print("⚠️ Localhost not accessible, trying with share=True...")
+                demo.launch(
+                    server_name="0.0.0.0",
+                    server_port=7860,
+                    share=True,  # Enable share as fallback
+                    show_error=True,
+                    quiet=False,
+                    inbrowser=False,
+                )
+            else:
+                raise
