@@ -135,6 +135,7 @@ except FileNotFoundError as e:
 def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
     """
     Batch scoring with the exact 25 features the calibrated model expects.
+    Uses GPU acceleration for feature engineering when available.
     """
     if raw_df is None or raw_df.empty:
         raise ValueError("No data provided")
@@ -1591,28 +1592,20 @@ if __name__ == "__main__":
     if is_spaces:
         print("Detected Hugging Face Spaces environment")
         # On Spaces, use default settings - Gradio handles everything automatically
-        # Add GPU decorator if available (for ZeroGPU or GPU hardware)
-        if SPACES_AVAILABLE:
-            print("GPU decorator available - using @spaces.GPU for GPU acceleration")
-            
-            @spaces.GPU
-            def launch_with_gpu():
-                # Perform GPU operations inside the decorated function to satisfy ZeroGPU
-                if CUPY_AVAILABLE:
-                    try:
-                        # Initialize GPU with a small operation
-                        test_gpu = cp.array([1.0, 2.0, 3.0])
-                        _ = cp.sum(test_gpu)
-                        print("✅ GPU initialized and ready for data processing")
-                    except Exception as e:
-                        print(f"⚠️ GPU initialization failed, using CPU: {e}")
-                
-                # Launch Gradio app
-                demo.launch()
-            
-            launch_with_gpu()
-        else:
-            demo.launch()
+        # Note: For ZeroGPU, use regular GPU hardware (T4, L4) instead
+        # ZeroGPU requires the entire function to be GPU-bound, which doesn't work with Gradio launch()
+        # GPU acceleration is used in score_batch() for feature engineering
+        if SPACES_AVAILABLE and CUPY_AVAILABLE:
+            print("✅ GPU acceleration available - will be used for data processing")
+            # Initialize GPU early to ensure it's ready
+            try:
+                test_gpu = cp.array([1.0, 2.0, 3.0])
+                _ = cp.sum(test_gpu)
+                print("✅ GPU initialized and ready")
+            except Exception as e:
+                print(f"⚠️ GPU initialization failed: {e}")
+        
+        demo.launch()
     else:
         print("Running locally - server will be available at http://127.0.0.1:7860")
         print("Watch this console for debug output when you upload files!")
