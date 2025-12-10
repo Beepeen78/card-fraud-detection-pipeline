@@ -5,6 +5,7 @@ import os
 import shutil
 import tempfile
 import uuid
+import threading
 import joblib
 import numpy as np
 import pandas as pd
@@ -173,15 +174,22 @@ def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
         ("dayofweek", 7, "dow_sin", "dow_cos")
     ]:
         if col in df.columns:
-            # Use GPU for large datasets if CuPy is available
-            if CUPY_AVAILABLE and len(df) > 1000:
+            # Use GPU for data processing if CuPy is available
+            # For ZeroGPU: Always try GPU if available (even for small datasets)
+            # For regular GPU: Use GPU for large datasets (>1000 rows)
+            use_gpu = CUPY_AVAILABLE and (len(df) > 100 or os.getenv("SPACE_ID") is not None)
+            
+            if use_gpu:
                 try:
                     gpu_array = cp.asarray(df[col].values)
                     angle = 2 * cp.pi * gpu_array / period
                     df[sin_col] = cp.asnumpy(cp.sin(angle))
                     df[cos_col] = cp.asnumpy(cp.cos(angle))
-                except Exception:
+                    if len(df) <= 100:
+                        print(f"   ✅ GPU used for {col} encoding (ZeroGPU context)")
+                except Exception as e:
                     # Fallback to CPU if GPU operation fails
+                    print(f"   ⚠️ GPU operation failed for {col}, using CPU: {e}")
                     angle = 2 * np.pi * df[col] / period
                     df[sin_col] = np.sin(angle)
                     df[cos_col] = np.cos(angle)
@@ -1584,25 +1592,64 @@ with gr.Blocks(
     """)
 
 
-# Module-level function for launching the app
+# Background thread to keep GPU context alive for ZeroGPU
+def keep_gpu_alive():
+    """Periodically perform GPU operations to keep ZeroGPU context alive."""
+    if not CUPY_AVAILABLE:
+        return
+    
+    while True:
+        try:
+            time.sleep(30)  # Perform GPU operation every 30 seconds
+            # Small GPU operation to keep context alive
+            test_array = cp.random.rand(100)
+            _ = float(cp.sum(test_array))
+        except Exception:
+            # If GPU fails, stop the thread
+            break
+
+
+# Module-level function for launching the app with GPU support
 def launch_app():
     """Launch the Gradio app with GPU support if available."""
-    # Initialize GPU operations early (for regular GPU hardware, not ZeroGPU)
+    # Initialize GPU operations INSIDE the decorated function (after ZeroGPU allocates device)
     if CUPY_AVAILABLE:
         try:
-            # Perform GPU operations to initialize context
+            # Perform GPU operations to initialize and verify GPU context
+            # This must happen INSIDE the decorated function for ZeroGPU
             test_gpu = cp.array([1.0, 2.0, 3.0])
             result = cp.sum(test_gpu)
             # Transfer result back to CPU to ensure operation completes
-            _ = float(result)
-            print("✅ GPU initialized and ready for data processing")
+            gpu_result = float(result)
+            print(f"✅ GPU initialized and ready for data processing (test result: {gpu_result})")
+            
+            # Perform additional GPU operations to keep context alive
+            # This helps ZeroGPU maintain the GPU allocation
+            for i in range(3):
+                test_array = cp.random.rand(1000)
+                _ = cp.sum(test_array)
+            print("✅ GPU context verified and active")
+            
+            # Start background thread to keep GPU alive (for ZeroGPU)
+            if os.getenv("SPACE_ID") is not None:
+                gpu_thread = threading.Thread(target=keep_gpu_alive, daemon=True)
+                gpu_thread.start()
+                print("✅ Background GPU keep-alive thread started")
         except Exception as e:
             print(f"⚠️ GPU initialization failed (will use CPU): {e}")
+            print("   Note: If using ZeroGPU, ensure GPU hardware is selected in Space settings")
     
     # Launch Gradio app - GPU will be used in prediction functions (score_batch)
-    # Note: ZeroGPU doesn't work with blocking launch() calls
-    # Use regular GPU hardware (T4, L4) instead of ZeroGPU for this app
+    # For ZeroGPU: Background thread keeps GPU context alive
+    # For regular GPU hardware: GPU is always available
     demo.launch()
+
+
+# Apply GPU decorator at module level for ZeroGPU detection
+# This must be at module level so ZeroGPU can detect it during import
+if SPACES_AVAILABLE:
+    print("Applying @spaces.GPU decorator for GPU support")
+    launch_app = spaces.GPU(launch_app)
 
 
 if __name__ == "__main__":
