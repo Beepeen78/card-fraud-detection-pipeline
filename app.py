@@ -24,6 +24,16 @@ except ImportError:
     SPACES_AVAILABLE = False
     spaces = None
 
+# Try to import GPU-accelerated libraries for data processing
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+    print("✅ CuPy available - GPU acceleration enabled for data processing")
+except ImportError:
+    CUPY_AVAILABLE = False
+    cp = None
+    print("⚠️ CuPy not available - using CPU for data processing")
+
 # Import Power BI export function
 try:
     from powerbi_export import export_powerbi_csvs
@@ -156,14 +166,29 @@ def score_batch(raw_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
         df["dayofyear"] = 150  # Mid-year as default
 
     # Cyclic encodings for hour and dayofweek
+    # Use GPU acceleration if available for large datasets
     for col, period, sin_col, cos_col in [
         ("hour", 24, "hour_sin", "hour_cos"),
         ("dayofweek", 7, "dow_sin", "dow_cos")
     ]:
         if col in df.columns:
-            angle = 2 * np.pi * df[col] / period
-            df[sin_col] = np.sin(angle)
-            df[cos_col] = np.cos(angle)
+            # Use GPU for large datasets if CuPy is available
+            if CUPY_AVAILABLE and len(df) > 1000:
+                try:
+                    gpu_array = cp.asarray(df[col].values)
+                    angle = 2 * cp.pi * gpu_array / period
+                    df[sin_col] = cp.asnumpy(cp.sin(angle))
+                    df[cos_col] = cp.asnumpy(cp.cos(angle))
+                except Exception:
+                    # Fallback to CPU if GPU operation fails
+                    angle = 2 * np.pi * df[col] / period
+                    df[sin_col] = np.sin(angle)
+                    df[cos_col] = np.cos(angle)
+            else:
+                # CPU computation for small datasets or when CuPy unavailable
+                angle = 2 * np.pi * df[col] / period
+                df[sin_col] = np.sin(angle)
+                df[cos_col] = np.cos(angle)
     
     # Time-based flags
     if "hour" in df.columns:
@@ -1566,12 +1591,25 @@ if __name__ == "__main__":
     if is_spaces:
         print("Detected Hugging Face Spaces environment")
         # On Spaces, use default settings - Gradio handles everything automatically
-        # Add GPU decorator if available (for GPU hardware selection)
+        # Add GPU decorator if available (for ZeroGPU or GPU hardware)
         if SPACES_AVAILABLE:
-            print("GPU decorator available - using @spaces.GPU")
+            print("GPU decorator available - using @spaces.GPU for GPU acceleration")
+            
             @spaces.GPU
             def launch_with_gpu():
+                # Perform GPU operations inside the decorated function to satisfy ZeroGPU
+                if CUPY_AVAILABLE:
+                    try:
+                        # Initialize GPU with a small operation
+                        test_gpu = cp.array([1.0, 2.0, 3.0])
+                        _ = cp.sum(test_gpu)
+                        print("✅ GPU initialized and ready for data processing")
+                    except Exception as e:
+                        print(f"⚠️ GPU initialization failed, using CPU: {e}")
+                
+                # Launch Gradio app
                 demo.launch()
+            
             launch_with_gpu()
         else:
             demo.launch()
