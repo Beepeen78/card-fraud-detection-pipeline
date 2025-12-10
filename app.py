@@ -1584,13 +1584,13 @@ with gr.Blocks(
     """)
 
 
-# Module-level function for GPU decorator (ZeroGPU needs this at import time)
+# Module-level function for launching the app
 def launch_app():
     """Launch the Gradio app with GPU support if available."""
-    # Initialize GPU operations to satisfy ZeroGPU requirements
+    # Initialize GPU operations early (for regular GPU hardware, not ZeroGPU)
     if CUPY_AVAILABLE:
         try:
-            # Perform GPU operations to keep context alive
+            # Perform GPU operations to initialize context
             test_gpu = cp.array([1.0, 2.0, 3.0])
             result = cp.sum(test_gpu)
             # Transfer result back to CPU to ensure operation completes
@@ -1599,13 +1599,10 @@ def launch_app():
         except Exception as e:
             print(f"⚠️ GPU initialization failed (will use CPU): {e}")
     
-    # Launch Gradio app - GPU will be used in prediction functions
+    # Launch Gradio app - GPU will be used in prediction functions (score_batch)
+    # Note: ZeroGPU doesn't work with blocking launch() calls
+    # Use regular GPU hardware (T4, L4) instead of ZeroGPU for this app
     demo.launch()
-
-
-# Apply GPU decorator at module level for ZeroGPU detection
-if SPACES_AVAILABLE:
-    launch_app = spaces.GPU(launch_app)
 
 
 if __name__ == "__main__":
