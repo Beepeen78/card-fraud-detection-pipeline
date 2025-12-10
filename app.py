@@ -1584,6 +1584,30 @@ with gr.Blocks(
     """)
 
 
+# Module-level function for GPU decorator (ZeroGPU needs this at import time)
+def launch_app():
+    """Launch the Gradio app with GPU support if available."""
+    # Initialize GPU operations to satisfy ZeroGPU requirements
+    if CUPY_AVAILABLE:
+        try:
+            # Perform GPU operations to keep context alive
+            test_gpu = cp.array([1.0, 2.0, 3.0])
+            result = cp.sum(test_gpu)
+            # Transfer result back to CPU to ensure operation completes
+            _ = float(result)
+            print("✅ GPU initialized and ready for data processing")
+        except Exception as e:
+            print(f"⚠️ GPU initialization failed (will use CPU): {e}")
+    
+    # Launch Gradio app - GPU will be used in prediction functions
+    demo.launch()
+
+
+# Apply GPU decorator at module level for ZeroGPU detection
+if SPACES_AVAILABLE:
+    launch_app = spaces.GPU(launch_app)
+
+
 if __name__ == "__main__":
     import os
     
@@ -1595,30 +1619,10 @@ if __name__ == "__main__":
     if is_spaces:
         print("Detected Hugging Face Spaces environment")
         # On Spaces, use default settings - Gradio handles everything automatically
-        # Add GPU decorator for ZeroGPU/GPU hardware support
+        # Use module-level launch_app function which has GPU decorator if available
         if SPACES_AVAILABLE:
             print("GPU decorator available - using @spaces.GPU")
-            
-            @spaces.GPU
-            def launch_with_gpu():
-                # Initialize GPU operations to satisfy ZeroGPU requirements
-                if CUPY_AVAILABLE:
-                    try:
-                        # Perform GPU operations to keep context alive
-                        test_gpu = cp.array([1.0, 2.0, 3.0])
-                        result = cp.sum(test_gpu)
-                        # Transfer result back to CPU to ensure operation completes
-                        _ = float(result)
-                        print("✅ GPU initialized and ready for data processing")
-                    except Exception as e:
-                        print(f"⚠️ GPU initialization failed (will use CPU): {e}")
-                
-                # Launch Gradio app - GPU will be used in prediction functions
-                demo.launch()
-            
-            launch_with_gpu()
-        else:
-            demo.launch()
+        launch_app()
     else:
         print("Running locally - server will be available at http://127.0.0.1:7860")
         print("Watch this console for debug output when you upload files!")
