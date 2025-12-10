@@ -16,6 +16,14 @@ from sklearn.metrics import (
     precision_recall_curve, average_precision_score, f1_score, roc_curve
 )
 
+# Import Hugging Face Spaces GPU decorator (optional, only works on Spaces)
+try:
+    import spaces
+    SPACES_AVAILABLE = True
+except ImportError:
+    SPACES_AVAILABLE = False
+    spaces = None
+
 # Import Power BI export function
 try:
     from powerbi_export import export_powerbi_csvs
@@ -1557,9 +1565,16 @@ if __name__ == "__main__":
     
     if is_spaces:
         print("Detected Hugging Face Spaces environment")
-        # On Spaces, use default settings (Gradio handles this automatically)
-        # Don't use queue() on Spaces as it can cause issues
-        demo.launch(show_error=True, server_name="0.0.0.0", server_port=7860)
+        # On Spaces, use default settings - Gradio handles everything automatically
+        # Add GPU decorator if available (for GPU hardware selection)
+        if SPACES_AVAILABLE:
+            print("GPU decorator available - using @spaces.GPU")
+            @spaces.GPU
+            def launch_with_gpu():
+                demo.launch()
+            launch_with_gpu()
+        else:
+            demo.launch()
     else:
         print("Running locally - server will be available at http://127.0.0.1:7860")
         print("Watch this console for debug output when you upload files!")
