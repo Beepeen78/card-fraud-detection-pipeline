@@ -1,633 +1,225 @@
-# Credit Card Fraud Detection System - Project Report
-
-**Project Name:** Credit Card Fraud Detection Pipeline  
-**Version:** 1.0  
-**Date:** January 2025  
-**Status:** Production Ready
-
----
-
-## Executive Summary
-
-This project implements a comprehensive machine learning-based fraud detection system for credit card transactions. The system uses an ensemble of calibrated LightGBM models to predict fraudulent transactions in real-time, with a focus on handling highly imbalanced datasets (typical fraud rate: 0.2%). The solution includes a web-based interface, comprehensive visualizations, Power BI integration, and automated monitoring capabilities.
-
-### Key Achievements
-- ✅ Real-time fraud detection with calibrated probability scores
-- ✅ 15 interactive visualizations for analysis
-- ✅ Power BI dashboard integration
-- ✅ Automated monthly evaluation and threshold optimization
-- ✅ GPU acceleration support for large-scale processing
-- ✅ Production-ready Gradio web interface
-
----
-
-## 1. Project Overview
-
-### 1.1 Problem Statement
-Credit card fraud is a significant challenge in financial services, with fraudsters constantly evolving their tactics. Traditional rule-based systems are insufficient, requiring a machine learning approach that can:
-- Detect fraud in real-time
-- Handle highly imbalanced data (fraud rate ~0.2%)
-- Provide interpretable risk scores
-- Adapt to changing fraud patterns
-
-### 1.2 Solution Approach
-The system employs a multi-layered approach:
-1. **Feature Engineering**: 25 engineered features from raw transaction data
-2. **Ensemble Modeling**: Calibrated LightGBM model for probability estimation
-3. **Real-time Scoring**: Batch processing with GPU acceleration support
-4. **Visualization**: 15 interactive charts for analysis
-5. **Integration**: Power BI dashboard for business users
-6. **Monitoring**: Automated monthly evaluation and threshold optimization
-
----
-
-## 2. System Architecture
-
-### 2.1 Core Components
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Web Interface (Gradio)                    │
-│  - File Upload & Processing                                  │
-│  - Interactive Visualizations (15 charts)                    │
-│  - Real-time Fraud Scoring                                   │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────────────┐
-│              Feature Engineering Pipeline                    │
-│  - Time-based features (hour, day, month, cyclic)           │
-│  - Velocity features (txn_count_last_1h, total_amt_last_24h)│
-│  - Aggregated features (mean, std, median, max)              │
-│  - Distance and location features                            │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────────────┐
-│            Calibrated LightGBM Model                         │
-│  - 25 engineered features                                   │
-│  - Probability calibration for threshold tuning              │
-│  - Handles imbalanced data                                   │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────────────┐
-│              Output & Integration                            │
-│  - Fraud probabilities & predictions                         │
-│  - Risk level classification                                │
-│  - Power BI export (automatic)                               │
-│  - Monthly evaluation reports                                │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 2.2 Technology Stack
-
-**Core ML & Data Processing:**
-- Python 3.8+
-- pandas 2.0+ (data manipulation)
-- numpy 1.26+ (numerical operations)
-- scikit-learn 1.7.1 (model calibration, metrics)
-- LightGBM 4.0+ (gradient boosting)
-- XGBoost 2.0+ (ensemble support)
-- joblib (model serialization)
-
-**Web Interface:**
-- Gradio 4.44+ (web UI framework)
-- Plotly 5.22+ (interactive visualizations)
-
-**Optional GPU Acceleration:**
-- CuPy (GPU-accelerated NumPy operations)
-
-**Business Intelligence:**
-- Power BI (dashboard and analytics)
-- Google Cloud BigQuery (optional data warehouse)
-
-**Monitoring & Evaluation:**
-- Custom Python scripts for monthly evaluation
-- JSON-based operating policy configuration
+Credit Card Fraud Detection Pipeline
+Version: 1.0
+Date: January 2025
+Status: Production Ready
 
----
-
-## 3. Model Details
-
-### 3.1 Model Architecture
-
-**Model Type:** Calibrated LightGBM Classifier  
-**Features:** 25 engineered features  
-**Calibration:** Probability calibration for reliable threshold tuning  
-**Output:** Fraud probability (0-1) and binary prediction
-
-### 3.2 Feature Engineering
-
-The model uses exactly **25 features** organized into categories:
-
-#### Time-Based Features (9 features)
-- `hour`, `dayofweek`, `month`, `dayofyear` (raw time components)
-- `hour_sin`, `hour_cos` (cyclic encoding for hour)
-- `dow_sin`, `dow_cos` (cyclic encoding for day of week)
-- `is_weekend`, `is_night`, `is_business_hours` (time-based flags)
-
-#### Transaction Amount Features (6 features)
-- `amt` (transaction amount)
-- `mean_amt`, `std_amt`, `median_amt`, `max_amt` (aggregated statistics)
-- `total_amt_last_1h`, `total_amt_last_24h` (velocity features)
-
-#### Transaction Count Features (3 features)
-- `transaction_count` (total transactions)
-- `txn_count_last_1h`, `txn_count_last_24h` (velocity features)
-
-#### Location & Distance Features (3 features)
-- `city_pop` (city population)
-- `dist_home_merch` (distance from home to merchant)
-- `dist_category_bucket_idx` (categorical distance bucket)
-
-#### Temporal Features (1 feature)
-- `time_since_last_txn` (seconds since last transaction)
-
-### 3.3 Model Training
-
-- **Training Data:** Historical transaction data with fraud labels
-- **Validation:** Time-based split to prevent data leakage
-- **Calibration:** Platt scaling or isotonic regression for probability calibration
-- **Hyperparameters:** Optimized for imbalanced data (class weights, focal loss)
-
-### 3.4 Expected Performance
-
-Based on typical fraud detection datasets:
-- **ROC-AUC**: ~0.81 (good discrimination between fraud and normal)
-- **PR-AUC**: 0.01-0.10 (typical for highly imbalanced data)
-- **Precision**: 0.01-0.20 (depends on threshold - lower threshold = lower precision)
-- **Recall**: 0.50-0.95 (depends on threshold - lower threshold = higher recall)
-
-**Note:** For imbalanced fraud data, use threshold **0.01-0.05** instead of 0.5. The default 0.5 is too high and will miss most fraud cases.
-
----
-
-## 4. Features & Capabilities
-
-### 4.1 Web Interface Features
-
-**File Upload & Processing:**
-- CSV file upload with automatic validation
-- Support for up to 10,000 rows per batch
-- Automatic feature engineering from raw data
-- Sample dataset for quick testing
-- Direct dataset file access (bypasses upload issues)
-
-**Interactive Visualizations (15 charts):**
-1. **Fraud Probability Distribution** - Histogram showing probability distribution
-2. **Risk Level Breakdown** - Pie chart of risk levels (Low/Medium/High/Critical)
-3. **Amount vs Fraud Probability** - Scatter plot showing relationship
-4. **Transaction Summary** - Bar chart with fraud statistics
-5. **Fraud Probability Over Time** - Time series with rolling average
-6. **Top 20 Most Suspicious Transactions** - Bar chart of highest risk transactions
-7. **Model Performance Metrics** - ROC-AUC, PR-AUC, Precision, Recall, F1-Score
-8. **Confusion Matrix** - Heatmap of true/false positives/negatives
-9. **ROC Curve** - Receiver Operating Characteristic curve
-10. **Precision-Recall Curve** - Better metric for imbalanced data
-11. **Amount Distribution Comparison** - Box plots comparing fraud vs normal
-12. **Probability Distribution Comparison** - Violin plots by actual/predicted labels
-13. **Feature Correlation Heatmap** - Top 15 features correlation matrix
-14. **Cumulative Fraud Detection** - Time series of cumulative fraud detection
-15. **Threshold Sensitivity Analysis** - Precision/Recall/F1 across thresholds
-
-**Real-time Analysis:**
-- Adjustable fraud detection threshold (0.01-0.99)
-- Instant fraud scoring with calibrated probabilities
-- Risk level classification (Low/Medium/High/Critical)
-- Top suspicious transactions table
-
-### 4.2 Power BI Integration
-
-**Automatic Data Export:**
-- Transactions scored with fraud probabilities
-- Daily aggregated metrics
-- Ready-to-use CSV format
-
-**Dashboard Components:**
-- 5 dashboard pages (Executive Summary, Transaction Analysis, Model Performance, Time Series, Geographic Analysis)
-- 30+ pre-built DAX measures
-- Custom color theme matching risk levels
-- Alert configuration and business rules
-- Complete setup documentation
-
-### 4.3 Monitoring & Evaluation
-
-**Monthly Evaluation Script:**
-- Automatic performance metrics calculation
-- Threshold optimization for target precision/recall
-- Operating policy configuration (JSON-based)
-- Monthly reports in `eval_out/monthly/YYYY-MM/`
-
-**Output Files:**
-- `metrics.json` - Performance metrics
-- `threshold_suggestion.json` - Recommended thresholds
-- `analyst_pack.xlsx` - Comprehensive analysis workbook
-
----
-
-## 5. Project Structure
-
-```
-card-fraud-detection-pipeline/
-│
-├── app.py                          # Main Gradio web application
-├── fraud_lgbm_calibrated.pkl       # Trained model file
-├── requirements.txt                # Python dependencies
-├── README_SPACE.md                 # Hugging Face Spaces documentation
-├── sample_transactions.csv         # Sample dataset for testing
-│
-├── dataset/
-│   └── fraudTest.csv               # Test dataset
-│
-├── notebooks/
-│   ├── eda_and_feature_engineering.ipynb  # EDA and model training
-│   ├── feature_columns.pkl         # Feature definitions
-│   └── operating_policy.json        # Operating policy configuration
-│
-├── powerbi/
-│   ├── README.md                   # Power BI documentation
-│   ├── QUICK_START.md              # Quick start guide
-│   ├── setup_instructions.md       # Detailed setup guide
-│   ├── dashboard_layout.md         # Dashboard design
-│   ├── dax_measures.txt            # Pre-built DAX measures
-│   ├── powerbi_theme.json          # Custom theme
-│   ├── alerts_and_rules.md         # Alert configuration
-│   ├── fraud_detection_queries.m   # Power Query scripts
-│   ├── prepare_powerbi_data.py     # Data preparation script
-│   └── out/                        # Exported data for Power BI
-│       ├── transactions_scored.csv
-│       └── metrics_daily.csv
-│
-├── monitoring/
-│   └── monthly_eval.py             # Monthly evaluation script
-│
-├── eval_out/                       # Evaluation outputs
-│   ├── predictions_calibrated.csv
-│   ├── queue_block.csv             # High-risk transactions
-│   ├── queue_review.csv            # Medium-risk transactions
-│   ├── run_report.json
-│   ├── threshold_suggestion.json
-│   ├── analyst_pack.xlsx
-│   └── monthly/
-│       └── YYYY-MM/
-│           ├── metrics.json
-│           └── threshold_suggestion.json
-│
-└── Card-Fraud-detection/           # Alternative Streamlit app
-    ├── app.py
-    ├── fraud_lgbm_calibrated.pkl
-    ├── powerbi_export.py
-    └── README.md
-```
-
----
-
-## 6. Installation & Setup
-
-### 6.1 Prerequisites
-
-- Python 3.8 or higher
-- pip package manager
-- (Optional) CUDA-capable GPU for acceleration
-
-### 6.2 Installation Steps
-
-1. **Clone or download the project:**
-   ```bash
-   cd card-fraud-detection-pipeline
-   ```
-
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Ensure model file exists:**
-   - The model file `fraud_lgbm_calibrated.pkl` should be in the project root
-   - If missing, train the model using the notebook: `notebooks/eda_and_feature_engineering.ipynb`
-
-4. **Run the application:**
-   ```bash
-   python app.py
-   ```
-
-5. **Access the web interface:**
-   - Open browser to `http://127.0.0.1:7860`
-   - Or use the provided URL if running on Hugging Face Spaces
-
-### 6.3 Optional GPU Setup
-
-For GPU acceleration (optional):
-```bash
-pip install cupy-cuda12x  # For CUDA 12.x
-# Or
-pip install cupy-cuda11x  # For CUDA 11.x
-```
-
----
-
-## 7. Usage Guide
-
-### 7.1 Basic Usage
-
-1. **Start the application:**
-   ```bash
-   python app.py
-   ```
-
-2. **Upload a CSV file or use sample data:**
-   - Click "📊 Use Sample Dataset" for quick testing
-   - Or upload your own CSV file
-   - Or click "📂 Use dataset/fraudTest.csv" to use the test dataset
-
-3. **Adjust the threshold:**
-   - Recommended: 0.01-0.05 for imbalanced data
-   - Lower threshold = higher recall (catches more fraud, more false positives)
-   - Higher threshold = higher precision (fewer false positives, may miss fraud)
-
-4. **Click "🔍 Detect Fraud"** to process transactions
-
-5. **View results:**
-   - Summary statistics in the main panel
-   - Top suspicious transactions table
-   - 15 interactive visualizations in tabs
-
-### 7.2 CSV File Format
-
-Your CSV should include at minimum:
-- `unix_time` or timestamp column (for time-based features)
-- `amt` or amount column (transaction amount)
-- `city_pop` (city population)
-- `dist_home_merch` (distance from home to merchant)
-- `category` (transaction category, optional)
-
-**Note:** If velocity features (like `txn_count_last_1h`) are missing, the system will fill them with sensible defaults based on the transaction data.
-
-### 7.3 Power BI Integration
-
-1. **Process transactions** in the web app (data exports automatically)
-
-2. **Open Power BI Desktop**
-
-3. **Load data:**
-   - Get Data → Text/CSV
-   - Select `powerbi/out/transactions_scored.csv`
-
-4. **Follow the guides:**
-   - `powerbi/QUICK_START.md` for basic dashboard
-   - `powerbi/setup_instructions.md` for complete setup
-
-### 7.4 Monthly Evaluation
-
-Run monthly evaluation to assess model performance:
-```bash
+Executive Summary
+This project delivers a machine learning–based credit card fraud detection system capable of real-time fraud scoring and business analytics.
+The solution uses a calibrated LightGBM ensemble model with automated feature engineering, GPU-accelerated processing, and Power BI integration for effective monitoring and decision-making.
+
+Highlights
+
+Real-time fraud detection with calibrated probability scores
+
+15 interactive visualizations for detailed analytics
+
+Power BI dashboard with automated data exports
+
+Monthly evaluation with threshold tuning
+
+GPU acceleration for large-scale inference
+
+User-friendly Gradio web interface
+
+1. Project Overview
+1.1 Problem Statement
+Credit card fraud poses a persistent challenge, with an average fraud rate of just 0.2%. Traditional rule-based systems fail to keep up with evolving fraud tactics. The main objectives were to:
+
+Detect fraud in real time.
+
+Handle extreme class imbalance.
+
+Generate interpretable risk probabilities.
+
+Adapt dynamically to new fraud behaviors.
+
+1.2 Solution Overview
+The proposed solution uses a multi-layered data and modeling pipeline:
+
+Feature Engineering: 25 features generated from raw transaction logs.
+
+Modeling: Calibrated LightGBM with probability tuning and class-weighting.
+
+Visualization: 15 interactive charts and Power BI dashboards.
+
+Integration: Automated exports and monthly evaluation modules.
+
+Deployment: Gradio-based production web app, GPU optional.
+
+2. System Architecture
+2.1 Core Components
+text
+┌──────────────────────┐
+│  Web Interface (Gradio) │
+│  • File upload, scoring │
+│  • 15 interactive charts │
+└─────────────┬────────────┘
+              │
+┌─────────────▼─────────────┐
+│ Feature Engineering Module │
+│  • Time, location, velocity │
+│  • Aggregation & cleaning   │
+└─────────────┬────────────┘
+              │
+┌─────────────▼────────────┐
+│ Calibrated LightGBM Model │
+│  • 25 engineered features  │
+│  • Probability calibration  │
+└─────────────┬────────────┘
+              │
+┌─────────────▼────────────┐
+│ Output & BI Integration   │
+│  • Predictions, risk tags │
+│  • Power BI export & eval │
+└───────────────────────────┘
+2.2 Technology Stack
+Layer	Tools & Libraries
+ML & Processing	Python 3.8+, pandas, numpy, scikit-learn, LightGBM, XGBoost, joblib
+Web Interface	Gradio, Plotly
+Acceleration (Optional)	CuPy (CUDA 11/12)
+Business Intelligence	Power BI, BigQuery
+Monitoring & Evaluation	Python scripts + JSON config
+3. Model Details
+3.1 Model Overview
+Type: Calibrated LightGBM Classifier
+
+Features: 25 engineered features across 5 categories
+
+Output: Fraud probability (0–1) + binary classification
+
+Calibration: Isotonic or Platt scaling
+
+3.2 Key Feature Groups
+Category	Description	Example Features
+Time-based (9)	Periodic transaction patterns	hour, dayofweek, hour_sin, is_weekend
+Amount-based (6)	Statistical + velocity metrics	amt, mean_amt, total_amt_last_24h
+Transaction Count (3)	Volume behavior	txn_count_last_1h, txn_count_last_24h
+Location (3)	Geo-based risk	city_pop, dist_home_merch
+Temporal (1)	Time gap	time_since_last_txn
+3.3 Training Details
+Dataset: Historical transactions labeled for fraud
+
+Validation: Time-based split (to avoid leakage)
+
+Loss Adjustment: Class weights & focal loss for imbalance
+
+Performance:
+
+ROC-AUC ≈ 0.81
+
+PR-AUC ≈ 0.05 (typical for 0.2% fraud rate)
+
+Recall: 0.60–0.95 @ threshold 0.01–0.05
+
+4. Features & Capabilities
+Web Interface
+Upload CSV (up to 10k rows) or use demo dataset
+
+Automatic feature extraction and cleaning
+
+Adjustable fraud threshold
+
+Real-time scoring with risk classification
+
+Interactive analytics with 15 visualizations (ROC, PR, correlation heatmap, etc.)
+
+Power BI Integration
+Auto-export of predictions to powerbi/out/transactions_scored.csv
+
+Ready-to-use five-page dashboard
+
+30+ DAX measures pre-configured
+
+Daily metrics, trend tracking, and alerting
+
+Monitoring
+Monthly evaluation script with metric tracking and threshold optimization
+
+Auto-generated reports in eval_out/monthly/YYYY-MM/
+
+5. Installation & Setup
+Requirements: Python ≥3.8, pip, optional GPU
+Setup:
+
+bash
+git clone https://github.com/Beepeen78/card-fraud-detection-pipeline
+cd card-fraud-detection-pipeline
+pip install -r requirements.txt
+python app.py
+Access the interface at http://127.0.0.1:7860
+
+For GPU acceleration:
+
+bash
+pip install cupy-cuda12x  # or cupy-cuda11x
+6. Deployment Options
+Environment	Description
+Local	Run locally via python app.py
+Hugging Face Spaces	Cloud deployment with GPU support
+Production	Use Gunicorn + Nginx + Docker for scalability and SSL
+7. Monitoring & Evaluation
+Command Example:
+
+bash
 python monitoring/monthly_eval.py \
   --input dataset/fraudTest.csv \
   --preds eval_out/predictions_calibrated.csv \
   --policy notebooks/operating_policy.json \
   --id_col trans_num
-```
+Generates metrics.json, threshold_suggestion.json, and analyst workbooks.
 
----
+8. Limitations & Future Work
+Current Limitations
 
-## 8. Performance Metrics & Evaluation
+Batch-only (no streaming yet)
 
-### 8.1 Model Performance
+Manual retraining required
 
-The model is designed for highly imbalanced fraud detection:
-<img width="1683" height="717" alt="image" src="https://github.com/user-attachments/assets/e3b00e68-c211-4645-b660-202b6e1dd166" />
-<img width="995" height="639" alt="image" src="https://github.com/user-attachments/assets/11760672-30e4-4a02-9648-dddfd15d8f76" />
-<img width="1338" height="591" alt="image" src="https://github.com/user-attachments/assets/d69eab7b-c565-4759-bd18-54d2c143a8ce" />
-<img width="1457" height="661" alt="image" src="https://github.com/user-attachments/assets/6a789284-c0ad-4711-950f-d2e1868a33ca" />
-<img width="1433" height="635" alt="image" src="https://github.com/user-attachments/assets/e05604b2-7ad3-4b2f-bc49-ffd8252404ef" />
-<img width="1436" height="642" alt="image" src="https://github.com/user-attachments/assets/95bc7b51-b654-4d4f-b48e-2eda7b787fce" />
-<img width="1406" height="587" alt="image" src="https://github.com/user-attachments/assets/3e17c383-3b14-4789-bd6d-5ddbd2182930" />
-<img width="1390" height="713" alt="image" src="https://github.com/user-attachments/assets/b05a0004-c15f-48f8-85b6-4dde1b8ed9b7" />
+Performance limited to ~10,000 rows per batch
 
-**Typical Performance:**
-- **ROC-AUC**: 0.80-0.85 (good discrimination)
-- **PR-AUC**: 0.01-0.10 (expected for 0.2% fraud rate)
-- **Precision at threshold 0.05**: 0.05-0.15
-- **Recall at threshold 0.05**: 0.60-0.85
+Upcoming Enhancements
 
-**Threshold Guidelines:**
-- **0.01-0.05**: High recall, catches most fraud (recommended for imbalanced data)
-- **0.05-0.10**: Balanced precision/recall
-- **0.10-0.50**: Higher precision, fewer false positives
-- **0.50+**: Very high precision, but will miss most fraud (not recommended)
+Real-time streaming via Kafka or RabbitMQ
 
-### 8.2 Evaluation Metrics
+Model serving API (FastAPI)
 
-The system calculates comprehensive metrics when ground truth is available:
+Explainability tools (SHAP, LIME)
 
-**Classification Metrics:**
-- Precision, Recall, F1-Score
-- Confusion Matrix (True/False Positives/Negatives)
-- Accuracy
+Drift detection and A/B testing
 
-**Probability Metrics:**
-- ROC-AUC (Area Under ROC Curve)
-- PR-AUC (Area Under Precision-Recall Curve) - better for imbalanced data
-- Threshold sensitivity analysis
+Deep learning extensions (LSTM, Transformer)
 
-**Business Metrics:**
-- Fraud detection rate
-- False positive rate
-- Cost analysis (if cost matrix provided)
+9. Conclusion
+The Credit Card Fraud Detection Pipeline provides a production-grade ML system blending technical precision with business usability.
+Its modular design, visualization depth, and calibration-aware modeling make it applicable for both real-time fraud screening and analytical research in financial domains.
 
-### 8.3 Monitoring
+Key Strengths
 
-**Monthly Evaluation:**
-- Automatic performance tracking
-- Threshold optimization
-- Trend analysis
-- Alert generation for performance degradation
+✅ Interactive and interpretable
 
----
+✅ Power BI business dashboard
 
-## 9. Technical Implementation Details
+✅ Automated monitoring and evaluation
 
-### 9.1 Feature Engineering Pipeline
+✅ GPU-ready and fault-tolerant
 
-The system automatically engineers 25 features from raw transaction data:
+✅ Extensively documented
 
-1. **Time Feature Extraction:**
-   - Parses `unix_time` to extract hour, day, month, day of year
-   - Creates cyclic encodings (sin/cos) for hour and day of week
-   - Generates time-based flags (weekend, night, business hours)
+Primary Use Cases
 
-2. **Velocity Features:**
-   - Transaction counts in last 1 hour and 24 hours
-   - Total amounts in last 1 hour and 24 hours
-   - Time since last transaction
+Fraud analytics teams
 
-3. **Aggregated Features:**
-   - Mean, median, standard deviation, max of transaction amounts
-   - Transaction count
+Financial institutions
 
-4. **Location Features:**
-   - City population
-   - Distance from home to merchant
-   - Distance category bucket index
+Payment gateways
 
-5. **Missing Value Handling:**
-   - Sensible defaults for missing velocity features
-   - Median/mean imputation for other missing values
-   - Handles NaN and infinite values
+E-commerce risk detection
 
-### 9.2 GPU Acceleration
+Contact & Support
+For questions, setup issues, or contributions:
 
-The system supports optional GPU acceleration for:
-- Cyclic encoding calculations (sin/cos)
-- Large batch processing (>100 rows)
-- ZeroGPU compatibility (Hugging Face Spaces)
+Review documentation in README_SPACE.md and powerbi/README.md.
 
-**Fallback:** Automatically falls back to CPU if GPU is unavailable.
+Check Power BI setup in powerbi/setup_instructions.md.
 
-### 9.3 Error Handling
-
-Comprehensive error handling for:
-- File upload issues (Windows temp file permissions)
-- Missing model file
-- Invalid CSV format
-- Missing required columns
-- GPU operation failures
-
-### 9.4 Data Export
-
-**Automatic Power BI Export:**
-- Exports scored transactions to `powerbi/out/transactions_scored.csv`
-- Exports daily metrics to `powerbi/out/metrics_daily.csv`
-- Includes all original columns plus fraud predictions
-
----
-
-## 10. Deployment Options
-
-### 10.1 Local Deployment
-
-```bash
-python app.py
-```
-- Runs on `http://127.0.0.1:7860`
-- Suitable for development and testing
-- Requires local Python environment
-
-### 10.2 Hugging Face Spaces
-
-The project is configured for Hugging Face Spaces deployment:
-- GPU support via `@spaces.GPU` decorator
-- Automatic model loading
-- Public or private deployment options
-
-**Configuration:**
-- `README_SPACE.md` contains Spaces configuration
-- `app_file: app.py` in metadata
-- SDK: Gradio 4.44+
-
-### 10.3 Production Deployment
-
-For production deployment:
-1. Use a production web server (Gunicorn, uWSGI)
-2. Set up reverse proxy (Nginx)
-3. Configure SSL/TLS
-4. Set up monitoring and logging
-5. Use containerization (Docker) for consistency
-
----
-
-## 11. Future Enhancements
-
-### 11.1 Planned Features
-
-1. **Real-time Streaming:**
-   - Kafka/RabbitMQ integration for real-time transaction processing
-   - WebSocket support for live updates
-
-2. **Model Improvements:**
-   - Online learning for model updates
-   - Ensemble of multiple models
-   - Deep learning models (LSTM, Transformer)
-
-3. **Enhanced Features:**
-   - Graph-based features (transaction networks)
-   - Behavioral biometrics
-   - Device fingerprinting
-
-4. **Explainability:**
-   - SHAP values for feature importance
-   - LIME explanations for individual predictions
-   - Model interpretability dashboard
-
-5. **Advanced Monitoring:**
-   - Drift detection
-   - Automated retraining pipeline
-   - A/B testing framework
-
-### 11.2 Scalability Improvements
-
-- Distributed processing (Spark, Dask)
-- Model serving API (FastAPI, Flask)
-- Database integration (PostgreSQL, MongoDB)
-- Caching layer (Redis)
-
----
-
-## 12. Limitations & Considerations
-
-### 12.1 Current Limitations
-
-1. **Batch Processing:** Limited to 10,000 rows per batch for performance
-2. **Feature Engineering:** Requires specific input columns (with defaults)
-3. **Model Updates:** Manual retraining required (no online learning)
-4. **Real-time:** Not optimized for sub-second latency requirements
-
-### 12.2 Data Requirements
-
-- Requires transaction data with time, amount, and location information
-- Works best with historical transaction patterns
-- May need domain-specific feature engineering for different use cases
-
-### 12.3 Performance Considerations
-
-- GPU acceleration recommended for large batches (>1000 rows)
-- Model file size: ~34 MB (LightGBM model)
-- Memory usage: ~500 MB - 2 GB depending on batch size
-
----
-
-## 13. Conclusion
-
-This Credit Card Fraud Detection System provides a comprehensive, production-ready solution for detecting fraudulent transactions. With its interactive web interface, comprehensive visualizations, Power BI integration, and automated monitoring, it offers both technical depth and business usability.
-
-The system's focus on handling imbalanced data, providing calibrated probabilities, and offering extensive visualization capabilities makes it suitable for both technical teams and business stakeholders.
-
-### Key Strengths
-
-✅ **Comprehensive:** 15 visualizations, Power BI integration, monitoring  
-✅ **User-Friendly:** Intuitive web interface with sample data  
-✅ **Production-Ready:** Error handling, GPU support, automated evaluation  
-✅ **Flexible:** Handles missing features, multiple input formats  
-✅ **Well-Documented:** Extensive documentation and guides
-
-### Use Cases
-
-- Financial institutions detecting credit card fraud
-- E-commerce platforms identifying fraudulent transactions
-- Payment processors screening transactions
-- Fraud analytics teams analyzing patterns
-- Data science teams learning fraud detection techniques
-
----
-
-## 14. Contact & Support
-
-For questions, issues, or contributions:
-- Review the documentation in `README_SPACE.md` and `powerbi/README.md`
-- Check the Power BI guides for dashboard setup
-- Review the monitoring scripts for evaluation setup
-
----
-
-**Report Generated:** January 2025  
-**Project Version:** 1.0  
-**Status:** Production Ready
-
+Submit issues or contributions via the project’s GitHub repository.
