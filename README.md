@@ -393,6 +393,14 @@ python monitoring/monthly_eval.py \
 ### 8.1 Model Performance
 
 The model is designed for highly imbalanced fraud detection:
+<img width="1683" height="717" alt="image" src="https://github.com/user-attachments/assets/e3b00e68-c211-4645-b660-202b6e1dd166" />
+<img width="995" height="639" alt="image" src="https://github.com/user-attachments/assets/11760672-30e4-4a02-9648-dddfd15d8f76" />
+<img width="1338" height="591" alt="image" src="https://github.com/user-attachments/assets/d69eab7b-c565-4759-bd18-54d2c143a8ce" />
+<img width="1457" height="661" alt="image" src="https://github.com/user-attachments/assets/6a789284-c0ad-4711-950f-d2e1868a33ca" />
+<img width="1433" height="635" alt="image" src="https://github.com/user-attachments/assets/e05604b2-7ad3-4b2f-bc49-ffd8252404ef" />
+<img width="1436" height="642" alt="image" src="https://github.com/user-attachments/assets/95bc7b51-b654-4d4f-b48e-2eda7b787fce" />
+<img width="1406" height="587" alt="image" src="https://github.com/user-attachments/assets/3e17c383-3b14-4789-bd6d-5ddbd2182930" />
+<img width="1390" height="713" alt="image" src="https://github.com/user-attachments/assets/b05a0004-c15f-48f8-85b6-4dde1b8ed9b7" />
 
 **Typical Performance:**
 - **ROC-AUC**: 0.80-0.85 (good discrimination)
